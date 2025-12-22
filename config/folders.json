@@ -1,0 +1,10 @@
+[
+    {
+        "id": "folder-1",
+        "name": "Games",
+        "color": "#3B82F6",
+        "posX": 100,
+        "posY": 100,
+        "items": []
+    }
+]
