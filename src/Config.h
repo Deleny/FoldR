@@ -7,6 +7,13 @@
 #include <windows.h>
 
 // Simple JSON parser for our config
+struct ConfigItem {
+    std::wstring name;
+    std::wstring path;
+    std::wstring originalPath;
+    std::string type;
+};
+
 struct ConfigFolder {
     std::wstring id;
     std::wstring name;
@@ -16,7 +23,7 @@ struct ConfigFolder {
     int iconSize = 64;
     int paneWidth = 360;
     int paneHeight = 280;
-    std::vector<std::pair<std::wstring, std::wstring>> items; // name, path pairs
+    std::vector<ConfigItem> items;
 };
 
 class Config {
@@ -129,12 +136,35 @@ inline std::vector<ConfigFolder> Config::LoadFolders(const std::wstring& path) {
     ConfigFolder current;
     bool inFolder = false;
     bool inItems = false;
-    std::pair<std::wstring, std::wstring> currentItem;
-    
     std::istringstream stream(content);
     std::string line;
     bool inItem = false;
-    std::wstring itemName, itemPath;
+    std::wstring itemName, itemPath, itemOriginalPath;
+    std::string itemType;
+
+    auto extractJsonField = [&](const std::string& source, const char* field, std::string& outValue) -> bool {
+        std::string needle = std::string("\"") + field + "\"";
+        size_t fieldPos = source.find(needle);
+        if (fieldPos == std::string::npos) return false;
+
+        size_t colonPos = source.find(":", fieldPos);
+        if (colonPos == std::string::npos) return false;
+
+        size_t quoteStart = source.find("\"", colonPos + 1);
+        if (quoteStart == std::string::npos) return false;
+
+        size_t quoteEnd = quoteStart + 1;
+        while (quoteEnd < source.size()) {
+            if (source[quoteEnd] == '"' && source[quoteEnd - 1] != '\\') {
+                break;
+            }
+            quoteEnd++;
+        }
+
+        if (quoteEnd >= source.size()) return false;
+        outValue = UnescapeJsonString(source.substr(quoteStart + 1, quoteEnd - quoteStart - 1));
+        return true;
+    };
     
     while (std::getline(stream, line)) {
         // Trim whitespace
@@ -175,13 +205,15 @@ inline std::vector<ConfigFolder> Config::LoadFolders(const std::wstring& path) {
                 inItem = true;
                 itemName.clear();
                 itemPath.clear();
+                itemOriginalPath.clear();
+                itemType.clear();
                 continue;
             }
             
             // End of an item object
             if (line.find("}") != std::string::npos && inItem) {
                 if (!itemName.empty() && !itemPath.empty()) {
-                    current.items.push_back({itemName, itemPath});
+                    current.items.push_back({itemName, itemPath, itemOriginalPath, itemType});
                 }
                 inItem = false;
                 continue;
@@ -189,45 +221,28 @@ inline std::vector<ConfigFolder> Config::LoadFolders(const std::wstring& path) {
             
             // Parse item fields (can be on same line like { "name": "...", "path": "..." })
             if (inItem || line.find("{") != std::string::npos) {
-                // Handle single-line item format: { "name": "...", "path": "..." }
-                size_t namePos = line.find("\"name\"");
-                if (namePos != std::string::npos) {
-                    size_t colonPos = line.find(":", namePos);
-                    if (colonPos != std::string::npos) {
-                        size_t quoteStart = line.find("\"", colonPos + 1);
-                        size_t quoteEnd = line.find("\"", quoteStart + 1);
-                        if (quoteStart != std::string::npos && quoteEnd != std::string::npos) {
-                            itemName = StringToWString(line.substr(quoteStart + 1, quoteEnd - quoteStart - 1));
-                        }
-                    }
+                std::string extracted;
+                if (extractJsonField(line, "name", extracted)) {
+                    itemName = StringToWString(extracted);
                 }
-                
-                size_t pathPos = line.find("\"path\"");
-                if (pathPos != std::string::npos) {
-                    size_t colonPos = line.find(":", pathPos);
-                    if (colonPos != std::string::npos) {
-                        size_t quoteStart = line.find("\"", colonPos + 1);
-                        // Find the closing quote, handling escaped quotes
-                        size_t quoteEnd = quoteStart + 1;
-                        while (quoteEnd < line.size()) {
-                            if (line[quoteEnd] == '"' && (quoteEnd == 0 || line[quoteEnd - 1] != '\\')) {
-                                break;
-                            }
-                            quoteEnd++;
-                        }
-                        if (quoteStart != std::string::npos && quoteEnd < line.size()) {
-                            std::string rawPath = line.substr(quoteStart + 1, quoteEnd - quoteStart - 1);
-                            itemPath = StringToWString(UnescapeJsonString(rawPath));
-                        }
-                    }
+                if (extractJsonField(line, "path", extracted)) {
+                    itemPath = StringToWString(extracted);
+                }
+                if (extractJsonField(line, "originalPath", extracted)) {
+                    itemOriginalPath = StringToWString(extracted);
+                }
+                if (extractJsonField(line, "type", extracted)) {
+                    itemType = extracted;
                 }
                 
                 // Single-line item format - { and } on same line
                 if (line.find("{") != std::string::npos && line.find("}") != std::string::npos) {
                     if (!itemName.empty() && !itemPath.empty()) {
-                        current.items.push_back({itemName, itemPath});
+                        current.items.push_back({itemName, itemPath, itemOriginalPath, itemType});
                         itemName.clear();
                         itemPath.clear();
+                        itemOriginalPath.clear();
+                        itemType.clear();
                     }
                     inItem = false;
                 } else if (line.find("{") != std::string::npos) {
@@ -310,10 +325,17 @@ inline bool Config::SaveFolders(const std::wstring& path, const std::vector<Conf
         file << "        \"paneHeight\": " << f.paneHeight << ",\n";
         file << "        \"items\": [\n";
         for (size_t j = 0; j < f.items.size(); j++) {
-            std::string escapedName = EscapeJsonString(WStringToString(f.items[j].first));
-            std::string escapedPath = EscapeJsonString(WStringToString(f.items[j].second));
-            file << "            { \"name\": \"" << escapedName 
-                 << "\", \"path\": \"" << escapedPath << "\" }";
+            std::string escapedName = EscapeJsonString(WStringToString(f.items[j].name));
+            std::string escapedPath = EscapeJsonString(WStringToString(f.items[j].path));
+            file << "            { \"name\": \"" << escapedName
+                 << "\", \"path\": \"" << escapedPath << "\"";
+            if (!f.items[j].originalPath.empty()) {
+                file << ", \"originalPath\": \"" << EscapeJsonString(WStringToString(f.items[j].originalPath)) << "\"";
+            }
+            if (!f.items[j].type.empty()) {
+                file << ", \"type\": \"" << EscapeJsonString(f.items[j].type) << "\"";
+            }
+            file << " }";
             if (j < f.items.size() - 1) file << ",";
             file << "\n";
         }

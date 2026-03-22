@@ -19,10 +19,18 @@
 // Forward declarations
 class FolderWidget;
 
+enum class WidgetItemType {
+    Shortcut,
+    Application,
+    Folder
+};
+
 // Item in a folder (renamed to avoid conflict with Windows SDK)
 struct WidgetItem {
     std::wstring name;
     std::wstring path;
+    std::wstring originalPath;
+    WidgetItemType type = WidgetItemType::Shortcut;
     std::wstring icon;
 };
 
@@ -61,6 +69,7 @@ public:
     void UpdatePosition(int x, int y);
     void SetExpanded(bool expanded);
     void ShowContextMenu(int x, int y, int itemIndex = -1);
+    bool PrepareForDeletion();
     
     // Hit test helper
     int GetItemIndexAt(int x, int y);
@@ -85,7 +94,7 @@ private:
     void Render();
     void RenderFolderIcon(Gdiplus::Graphics& g, int x, int y);
     void RenderExpandedPane(Gdiplus::Graphics& g, int x, int y);
-    void RenderItem(Gdiplus::Graphics& g, const WidgetItem& item, int x, int y, int width, int height);
+    void RenderItem(Gdiplus::Graphics& g, const WidgetItem& item, int x, int y, int width, int height, bool selected);
     void ShowContextMenu(int x, int y);
     
     void OnPaint();
@@ -97,6 +106,9 @@ private:
     void OnMouseWheel(int delta);
     void OnDrop(const std::vector<std::wstring>& files);
     RECT GetPaneRect() const;
+    bool IsPointInPane(int x, int y) const;
+    bool TryGetItemCardRect(int itemIndex, RECT& rect) const;
+    RECT GetSelectionMarqueeRect() const;
     int HitTestResizeHandle(int x, int y) const;
     int GetIconSize() const;
     int GetCollapsedWidth() const;
@@ -110,6 +122,15 @@ private:
     int GetItemRowHeight() const;
     int GetItemCardWidth() const;
     int GetItemCardHeight() const;
+    bool IsItemSelected(const std::wstring& path) const;
+    void ClearItemSelection();
+    void SelectSingleItem(const std::wstring& path);
+    void RemoveSelectedItems();
+    int GetSelectedItemCount() const;
+    void UpdateSelectionFromMarquee();
+    bool HasItemPath(const std::wstring& sourcePath) const;
+    bool TryRestoreItem(const WidgetItem& item, std::wstring* restoredPath);
+    void ShowItemRestoreFailure(const WidgetItem& item) const;
 
     HWND m_hwnd;
     HINSTANCE m_hInstance;
@@ -127,6 +148,10 @@ private:
     int m_resizeEdges;
     bool m_isDragOver;
     int m_hoveredItemIndex;
+    bool m_isSelectingItems;
+    POINT m_selectionStart;
+    POINT m_selectionCurrent;
+    bool m_selectionMoved;
     
     // Window dimensions
     static const int ICON_SIZE = 64;
@@ -135,6 +160,7 @@ private:
 private:
     Gdiplus::Bitmap* GetIconForFile(const std::wstring& path);
     std::map<std::wstring, Gdiplus::Bitmap*> m_iconCache;
+    std::vector<std::wstring> m_selectedItemPaths;
     
     // Launch animation
     int m_clickedItemIndex;
@@ -166,6 +192,9 @@ public:
     void RemoveSystemTray();
     void ShowTrayMenu();
     void ShowTrayMenu(POINT anchor);
+    void SetLaunchOnStart(bool enabled);
+    void ToggleLaunchOnStart();
+    bool IsLaunchOnStartEnabled();
     
     const std::vector<std::unique_ptr<FolderWidget>>& GetFolders() const { return m_folders; }
 
@@ -176,6 +205,7 @@ private:
     void AddToStartup();
     void RemoveFromStartup();
     bool IsInStartup();
+    void ShowTrayNotification(const wchar_t* title, const wchar_t* message);
     std::wstring GetConfigPath();
     void EnsureConfigDirectory();
     
@@ -183,4 +213,5 @@ private:
     std::vector<std::unique_ptr<FolderWidget>> m_folders;
     NOTIFYICONDATAW m_trayIcon;
     HWND m_trayHwnd;
+    bool m_launchOnStartEnabled = false;
 };

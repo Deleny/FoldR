@@ -3,14 +3,371 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <cwctype>
+#include <stdexcept>
+#include <shobjidl_core.h>
 
 namespace {
     void EnsureUiAssets();
     HICON GetAppIcon(bool smallIcon);
     POINT FindNextFolderPosition(int iconSize);
     POINT ClampFolderPosition(int desiredX, int desiredY, int iconSize);
+    RECT GetFolderCollisionRect(int posX, int posY, int iconSize);
     bool FolderPositionOverlaps(const FolderWidget* movingWidget, int desiredX, int desiredY, int iconSize);
     POINT ResolveFolderPosition(const FolderWidget* movingWidget, int desiredX, int desiredY, int iconSize);
+
+    std::wstring GetExecutablePath() {
+        wchar_t exePath[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+        return exePath;
+    }
+
+    std::wstring GetExecutableDirectory() {
+        std::wstring exePath = GetExecutablePath();
+        const size_t lastSlash = exePath.find_last_of(L"\\/");
+        return lastSlash == std::wstring::npos ? std::wstring() : exePath.substr(0, lastSlash);
+    }
+
+    std::wstring GetStartupShortcutPath() {
+        wchar_t startupPath[MAX_PATH] = {};
+        if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_STARTUP, nullptr, 0, startupPath))) {
+            return std::wstring(startupPath) + L"\\FoldR.lnk";
+        }
+
+        return GetExecutableDirectory() + L"\\FoldR Startup.lnk";
+    }
+
+    bool HasStartupRegistryEntry() {
+        const wchar_t* REG_RUN_KEY = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+        const wchar_t* APP_NAME = L"FolderWidget";
+
+        wchar_t existingPath[MAX_PATH] = {0};
+        DWORD size = sizeof(existingPath);
+        DWORD type = 0;
+        LONG result = RegGetValueW(
+            HKEY_CURRENT_USER,
+            REG_RUN_KEY,
+            APP_NAME,
+            RRF_RT_REG_SZ,
+            &type,
+            existingPath,
+            &size
+        );
+
+        return (result == ERROR_SUCCESS && existingPath[0] != L'\0');
+    }
+
+    void RemoveStartupRegistryEntry() {
+        const wchar_t* REG_RUN_KEY = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+        const wchar_t* APP_NAME = L"FolderWidget";
+
+        HKEY hKey = nullptr;
+        LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, REG_RUN_KEY, 0, KEY_SET_VALUE, &hKey);
+        if (result == ERROR_SUCCESS) {
+            RegDeleteValueW(hKey, APP_NAME);
+            RegCloseKey(hKey);
+        }
+    }
+
+    std::wstring GetFolderWidgetDataDirectory() {
+        wchar_t appDataPath[MAX_PATH] = {};
+        if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, appDataPath))) {
+            return std::wstring(appDataPath) + L"\\FolderWidget";
+        }
+
+        return GetExecutableDirectory();
+    }
+
+    std::wstring GetFolderStoreRoot() {
+        return GetFolderWidgetDataDirectory() + L"\\store";
+    }
+
+    std::wstring GetFolderStoreDirectory(const std::wstring& folderId) {
+        return GetFolderStoreRoot() + L"\\" + folderId;
+    }
+
+    std::wstring GetDesktopDirectoryPath() {
+        wchar_t desktopPath[MAX_PATH] = {};
+        if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_DESKTOPDIRECTORY, nullptr, 0, desktopPath))) {
+            return desktopPath;
+        }
+
+        return GetExecutableDirectory();
+    }
+
+    void EnsureDirectoryExists(const std::wstring& path) {
+        if (!path.empty()) {
+            SHCreateDirectoryExW(nullptr, path.c_str(), nullptr);
+        }
+    }
+
+    void EnsureParentDirectoryExists(const std::wstring& path) {
+        const size_t slash = path.find_last_of(L"\\/");
+        if (slash != std::wstring::npos) {
+            EnsureDirectoryExists(path.substr(0, slash));
+        }
+    }
+
+    std::wstring GenerateStorageToken() {
+        GUID guid = {};
+        if (SUCCEEDED(CoCreateGuid(&guid))) {
+            wchar_t buffer[40] = {};
+            if (StringFromGUID2(guid, buffer, ARRAYSIZE(buffer)) > 0) {
+                std::wstring token;
+                token.reserve(32);
+                for (wchar_t ch : std::wstring(buffer)) {
+                    if (iswxdigit(ch)) {
+                        token.push_back(static_cast<wchar_t>(towlower(ch)));
+                    }
+                }
+                if (!token.empty()) {
+                    return token;
+                }
+            }
+        }
+
+        wchar_t fallback[32] = {};
+        swprintf_s(fallback, L"%08llx%08x", GetTickCount64(), GetCurrentProcessId());
+        return fallback;
+    }
+
+    WidgetItemType ClassifyWidgetItemType(const std::wstring& path) {
+        DWORD attributes = GetFileAttributesW(path.c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            return WidgetItemType::Folder;
+        }
+
+        const size_t dot = path.find_last_of(L'.');
+        std::wstring extension = dot == std::wstring::npos ? L"" : path.substr(dot);
+        std::transform(extension.begin(), extension.end(), extension.begin(), towlower);
+        if (extension == L".exe") {
+            return WidgetItemType::Application;
+        }
+
+        return WidgetItemType::Shortcut;
+    }
+
+    std::string WidgetItemTypeToConfigValue(WidgetItemType type) {
+        switch (type) {
+            case WidgetItemType::Application:
+                return "application";
+            case WidgetItemType::Folder:
+                return "folder";
+            case WidgetItemType::Shortcut:
+            default:
+                return "shortcut";
+        }
+    }
+
+    WidgetItemType WidgetItemTypeFromConfigValue(const std::string& value, const std::wstring& fallbackPath) {
+        if (value == "application") {
+            return WidgetItemType::Application;
+        }
+        if (value == "folder") {
+            return WidgetItemType::Folder;
+        }
+        if (value == "shortcut") {
+            return WidgetItemType::Shortcut;
+        }
+        return ClassifyWidgetItemType(fallbackPath);
+    }
+
+    bool IsManagedItem(const WidgetItem& item) {
+        return !item.originalPath.empty();
+    }
+
+    bool PathExistsForType(const std::wstring& path, WidgetItemType type) {
+        if (path.empty()) {
+            return false;
+        }
+
+        return type == WidgetItemType::Folder ? GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES &&
+            (GetFileAttributesW(path.c_str()) & FILE_ATTRIBUTE_DIRECTORY) != 0
+            : GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES &&
+                (GetFileAttributesW(path.c_str()) & FILE_ATTRIBUTE_DIRECTORY) == 0;
+    }
+
+    void CopyDirectoryRecursive(const std::wstring& sourcePath, const std::wstring& destinationPath) {
+        EnsureDirectoryExists(destinationPath);
+
+        WIN32_FIND_DATAW findData = {};
+        HANDLE findHandle = FindFirstFileW((sourcePath + L"\\*").c_str(), &findData);
+        if (findHandle == INVALID_HANDLE_VALUE) {
+            return;
+        }
+
+        do {
+            const std::wstring name = findData.cFileName;
+            if (name == L"." || name == L"..") {
+                continue;
+            }
+
+            const std::wstring sourceChild = sourcePath + L"\\" + name;
+            const std::wstring destinationChild = destinationPath + L"\\" + name;
+
+            if ((findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+                CopyDirectoryRecursive(sourceChild, destinationChild);
+            } else {
+                EnsureParentDirectoryExists(destinationChild);
+                if (!CopyFileW(sourceChild.c_str(), destinationChild.c_str(), TRUE)) {
+                    FindClose(findHandle);
+                    throw std::runtime_error("Failed to copy directory contents.");
+                }
+            }
+        } while (FindNextFileW(findHandle, &findData));
+
+        FindClose(findHandle);
+    }
+
+    std::wstring MoveFilePath(const std::wstring& sourcePath, const std::wstring& destinationPath) {
+        EnsureParentDirectoryExists(destinationPath);
+
+        if (_wcsicmp(sourcePath.c_str(), destinationPath.c_str()) == 0) {
+            return destinationPath;
+        }
+
+        if (!MoveFileExW(sourcePath.c_str(), destinationPath.c_str(), MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH)) {
+            if (!CopyFileW(sourcePath.c_str(), destinationPath.c_str(), TRUE) || !DeleteFileW(sourcePath.c_str())) {
+                throw std::runtime_error("Failed to move file into FoldR storage.");
+            }
+        }
+
+        return destinationPath;
+    }
+
+    std::wstring MoveDirectoryPath(const std::wstring& sourcePath, const std::wstring& destinationPath) {
+        EnsureParentDirectoryExists(destinationPath);
+
+        if (_wcsicmp(sourcePath.c_str(), destinationPath.c_str()) == 0) {
+            return destinationPath;
+        }
+
+        if (!MoveFileExW(sourcePath.c_str(), destinationPath.c_str(), MOVEFILE_WRITE_THROUGH)) {
+            CopyDirectoryRecursive(sourcePath, destinationPath);
+            if (!RemoveDirectoryW(sourcePath.c_str())) {
+                SHFILEOPSTRUCTW deleteOp = {};
+                std::wstring from = sourcePath;
+                from.push_back(L'\0');
+                deleteOp.wFunc = FO_DELETE;
+                deleteOp.pFrom = from.c_str();
+                deleteOp.fFlags = FOF_NOERRORUI | FOF_NOCONFIRMATION | FOF_SILENT;
+                SHFileOperationW(&deleteOp);
+            }
+        }
+
+        return destinationPath;
+    }
+
+    bool CreateShellShortcutFile(
+        const std::wstring& shortcutPath,
+        const std::wstring& targetPath,
+        const std::wstring& description,
+        const std::wstring& workingDirectory) {
+        EnsureParentDirectoryExists(shortcutPath);
+
+        IShellLinkW* shellLink = nullptr;
+        HRESULT hr = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&shellLink));
+        if (FAILED(hr) || !shellLink) {
+            return false;
+        }
+
+        shellLink->SetPath(targetPath.c_str());
+        shellLink->SetDescription(description.c_str());
+        shellLink->SetWorkingDirectory(workingDirectory.c_str());
+        shellLink->SetIconLocation(targetPath.c_str(), 0);
+
+        IPersistFile* persistFile = nullptr;
+        hr = shellLink->QueryInterface(IID_PPV_ARGS(&persistFile));
+        if (FAILED(hr) || !persistFile) {
+            shellLink->Release();
+            return false;
+        }
+
+        hr = persistFile->Save(shortcutPath.c_str(), TRUE);
+        persistFile->Release();
+        shellLink->Release();
+        return SUCCEEDED(hr);
+    }
+
+    std::wstring StoreManagedItemInFolder(const std::wstring& sourcePath, const std::wstring& folderId, WidgetItemType type) {
+        const std::wstring token = GenerateStorageToken();
+        const std::wstring folderStoreDirectory = GetFolderStoreDirectory(folderId);
+        EnsureDirectoryExists(folderStoreDirectory);
+
+        if (type == WidgetItemType::Application) {
+            const std::wstring shortcutPath = folderStoreDirectory + L"\\" + token + L".lnk";
+            std::wstring description = sourcePath.substr(sourcePath.find_last_of(L"\\/") + 1);
+            const size_t dot = description.find_last_of(L'.');
+            if (dot != std::wstring::npos) {
+                description = description.substr(0, dot);
+            }
+            const size_t slash = sourcePath.find_last_of(L"\\/");
+            const std::wstring workingDirectory = slash == std::wstring::npos ? GetExecutableDirectory() : sourcePath.substr(0, slash);
+            if (!CreateShellShortcutFile(shortcutPath, sourcePath, description, workingDirectory)) {
+                throw std::runtime_error("Failed to create application shortcut.");
+            }
+            return shortcutPath;
+        }
+
+        if (type == WidgetItemType::Folder) {
+            return MoveDirectoryPath(sourcePath, folderStoreDirectory + L"\\" + token);
+        }
+
+        const size_t dot = sourcePath.find_last_of(L'.');
+        const std::wstring extension = dot == std::wstring::npos ? L"" : sourcePath.substr(dot);
+        return MoveFilePath(sourcePath, folderStoreDirectory + L"\\" + token + extension);
+    }
+
+    std::wstring EnsureUniqueRestorePath(const std::wstring& basePath, bool isDirectory) {
+        if (!PathExistsForType(basePath, isDirectory ? WidgetItemType::Folder : WidgetItemType::Shortcut)) {
+            return basePath;
+        }
+
+        const size_t slash = basePath.find_last_of(L"\\/");
+        const std::wstring parent = slash == std::wstring::npos ? GetDesktopDirectoryPath() : basePath.substr(0, slash);
+        const std::wstring leaf = slash == std::wstring::npos ? basePath : basePath.substr(slash + 1);
+        const size_t dot = isDirectory ? std::wstring::npos : leaf.find_last_of(L'.');
+        const std::wstring stem = dot == std::wstring::npos ? leaf : leaf.substr(0, dot);
+        const std::wstring extension = dot == std::wstring::npos ? L"" : leaf.substr(dot);
+
+        for (int index = 1; index < 1000; ++index) {
+            std::wstring suffix = index == 1 ? L"Restored from FoldR" : L"Restored from FoldR " + std::to_wstring(index);
+            std::wstring candidate = parent + L"\\" + stem + L" (" + suffix + L")" + extension;
+            if (!PathExistsForType(candidate, isDirectory ? WidgetItemType::Folder : WidgetItemType::Shortcut)) {
+                return candidate;
+            }
+        }
+
+        throw std::runtime_error("Could not find a free restore path.");
+    }
+
+    std::wstring ResolveRestoreDestination(const WidgetItem& item) {
+        std::wstring preferredPath = item.originalPath;
+        const size_t slash = item.originalPath.find_last_of(L"\\/");
+        const std::wstring originalLeaf = slash == std::wstring::npos ? item.originalPath : item.originalPath.substr(slash + 1);
+        const std::wstring parent = slash == std::wstring::npos ? L"" : item.originalPath.substr(0, slash);
+
+        if (parent.empty() || GetFileAttributesW(parent.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            preferredPath = GetDesktopDirectoryPath() + L"\\" + originalLeaf;
+        }
+
+        return EnsureUniqueRestorePath(preferredPath, item.type == WidgetItemType::Folder);
+    }
+
+    void DeleteFolderStoreDirectory(const std::wstring& folderId) {
+        const std::wstring storeDirectory = GetFolderStoreDirectory(folderId);
+        if (GetFileAttributesW(storeDirectory.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            return;
+        }
+
+        std::wstring from = storeDirectory;
+        from.push_back(L'\0');
+        SHFILEOPSTRUCTW deleteOp = {};
+        deleteOp.wFunc = FO_DELETE;
+        deleteOp.pFrom = from.c_str();
+        deleteOp.fFlags = FOF_NOERRORUI | FOF_NOCONFIRMATION | FOF_SILENT;
+        SHFileOperationW(&deleteOp);
+    }
 }
 
 // Custom rename modal
@@ -399,11 +756,15 @@ const wchar_t* TRAY_CLASS = L"FolderWidgetTrayClass";
 // Tray icon ID
 #define WM_TRAYICON (WM_USER + 1)
 #define ID_TRAY_NEW_FOLDER 1001
-#define ID_TRAY_EXIT 1002
+#define ID_TRAY_LAUNCH_ON_START 1002
+#define ID_TRAY_EXIT 1003
 #define ID_MENU_RENAME_FOLDER 2001
 #define ID_MENU_DELETE_FOLDER 2002
+#define ID_MENU_SIZE_SUBMENU 2003
+#define ID_MENU_COLOR_SUBMENU 2004
 #define ID_MENU_OPEN_LOCATION 2010
 #define ID_MENU_REMOVE_ITEM 2011
+#define ID_MENU_REMOVE_SELECTED 2012
 #define ID_MENU_COLOR_AZURE 2101
 #define ID_MENU_COLOR_MINT 2102
 #define ID_MENU_COLOR_CRIMSON 2103
@@ -431,6 +792,15 @@ namespace {
     constexpr COLORREF MENU_DANGER = RGB(190, 24, 93);
     constexpr COLORREF MENU_SWATCH_BORDER = RGB(203, 213, 225);
     constexpr COLORREF MENU_NO_COLOR = 0xFFFFFFFF;
+    constexpr COLORREF TRAY_MENU_BG = RGB(245, 245, 245);
+    constexpr COLORREF TRAY_MENU_TEXT = RGB(18, 18, 18);
+    constexpr COLORREF TRAY_MENU_HOVER_BG = RGB(201, 228, 253);
+    constexpr COLORREF TRAY_MENU_HOVER_BORDER = RGB(153, 209, 255);
+    constexpr COLORREF TRAY_MENU_CHECK = RGB(0, 120, 215);
+    constexpr COLORREF ITEM_SELECTION_ACCENT = RGB(72, 235, 255);
+    constexpr COLORREF ITEM_CARD_BASE = RGB(42, 47, 62);
+    constexpr COLORREF ITEM_CARD_SELECTED = RGB(52, 58, 77);
+    constexpr COLORREF ITEM_CARD_BORDER = RGB(78, 87, 110);
     constexpr int DEFAULT_FOLDER_ICON_SIZE = 64;
     constexpr int DEFAULT_PANE_WIDTH = 360;
     constexpr int DEFAULT_PANE_HEIGHT = 280;
@@ -443,6 +813,7 @@ namespace {
     constexpr int FOLDER_ICON_PADDING = 16;
     constexpr int FOLDER_LABEL_EXTRA_HEIGHT = 15;
     constexpr int FOLDER_SLOT_GAP = 12;
+    constexpr int FOLDER_COLLISION_GAP = 2;
     constexpr int FOLDER_SEARCH_STEP = 12;
     constexpr int FOLDER_ICON_SIZE_PRESETS[] = { 48, 56, 64, 72, 80 };
     constexpr int ITEM_MIN_SLOT_WIDTH = 84;
@@ -458,6 +829,7 @@ namespace {
     HBRUSH g_menuBackgroundBrush = nullptr;
     COLORREF g_activeFolderMenuColor = MENU_NO_COLOR;
     int g_activeFolderMenuIconSize = DEFAULT_FOLDER_ICON_SIZE;
+    bool g_trayLaunchOnStartEnabled = false;
 
     struct MenuVisualSpec {
         UINT id;
@@ -467,6 +839,8 @@ namespace {
         COLORREF swatchColor;
         bool sizeChoice;
         int iconSize;
+        bool toggleChoice = false;
+        bool submenuChoice = false;
     };
 
     int NormalizeFolderIconSize(int iconSize) {
@@ -618,14 +992,36 @@ namespace {
         return g_menuBackgroundBrush;
     }
 
+    bool IsTrayMenuItem(UINT itemId) {
+        return itemId == ID_TRAY_NEW_FOLDER || itemId == ID_TRAY_LAUNCH_ON_START || itemId == ID_TRAY_EXIT;
+    }
+
+    const MenuVisualSpec* GetMenuVisualSpec(UINT itemId);
+
+    const MenuVisualSpec* ResolveMenuVisualSpec(UINT itemId, ULONG_PTR itemData) {
+        if (itemId != 0) {
+            return GetMenuVisualSpec(itemId);
+        }
+
+        if (itemData != 0 && itemData <= UINT_MAX) {
+            return GetMenuVisualSpec(static_cast<UINT>(itemData));
+        }
+
+        return nullptr;
+    }
+
     const MenuVisualSpec* GetMenuVisualSpec(UINT itemId) {
         static const MenuVisualSpec specs[] = {
             { ID_TRAY_NEW_FOLDER, L"New Folder", false, false, 0, false, 0 },
+            { ID_TRAY_LAUNCH_ON_START, L"Launch on Startup", false, false, 0, false, 0, true },
             { ID_TRAY_EXIT, L"Exit FoldR", true, false, 0, false, 0 },
             { ID_MENU_RENAME_FOLDER, L"Rename Folder", false, false, 0, false, 0 },
             { ID_MENU_DELETE_FOLDER, L"Delete Folder", true, false, 0, false, 0 },
+            { ID_MENU_SIZE_SUBMENU, L"Size", false, false, 0, false, 0, false, true },
+            { ID_MENU_COLOR_SUBMENU, L"Color", false, false, 0, false, 0, false, true },
             { ID_MENU_OPEN_LOCATION, L"Open File Location", false, false, 0, false, 0 },
             { ID_MENU_REMOVE_ITEM, L"Remove From Folder", true, false, 0, false, 0 },
+            { ID_MENU_REMOVE_SELECTED, L"Remove Selected Items", true, false, 0, false, 0 },
             { ID_MENU_SIZE_COMPACT, L"Size Compact", false, false, 0, true, 48 },
             { ID_MENU_SIZE_SMALL, L"Size Small", false, false, 0, true, 56 },
             { ID_MENU_SIZE_MEDIUM, L"Size Medium", false, false, 0, true, 64 },
@@ -670,12 +1066,28 @@ namespace {
         AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, itemId, spec->label);
     }
 
+    void AppendStyledSubmenuItem(HMENU menu, UINT itemId, HMENU submenu) {
+        const MenuVisualSpec* spec = GetMenuVisualSpec(itemId);
+        if (!spec) {
+            return;
+        }
+
+        MENUITEMINFOW menuItem = {};
+        menuItem.cbSize = sizeof(menuItem);
+        menuItem.fMask = MIIM_ID | MIIM_FTYPE | MIIM_SUBMENU | MIIM_DATA;
+        menuItem.fType = MFT_OWNERDRAW;
+        menuItem.wID = itemId;
+        menuItem.hSubMenu = submenu;
+        menuItem.dwItemData = static_cast<ULONG_PTR>(itemId);
+        InsertMenuItemW(menu, GetMenuItemCount(menu), TRUE, &menuItem);
+    }
+
     bool HandleStyledMenuMeasure(MEASUREITEMSTRUCT* measureItem) {
         if (!measureItem || measureItem->CtlType != ODT_MENU) {
             return false;
         }
 
-        const MenuVisualSpec* spec = GetMenuVisualSpec(measureItem->itemID);
+        const MenuVisualSpec* spec = ResolveMenuVisualSpec(measureItem->itemID, measureItem->itemData);
         if (!spec) {
             return false;
         }
@@ -692,8 +1104,13 @@ namespace {
 
         const int textWidth = static_cast<int>(textSize.cx);
         const int textHeight = static_cast<int>(textSize.cy);
-        measureItem->itemWidth = (std::max)(ScaleByDpi(196, dpi), textWidth + ScaleByDpi(40, dpi));
-        measureItem->itemHeight = (std::max)(ScaleByDpi(34, dpi), textHeight + ScaleByDpi(14, dpi));
+        if (IsTrayMenuItem(measureItem->itemID)) {
+            measureItem->itemWidth = (std::max)(ScaleByDpi(220, dpi), textWidth + ScaleByDpi(54, dpi));
+            measureItem->itemHeight = (std::max)(ScaleByDpi(28, dpi), textHeight + ScaleByDpi(10, dpi));
+        } else {
+            measureItem->itemWidth = (std::max)(ScaleByDpi(196, dpi), textWidth + ScaleByDpi(40, dpi));
+            measureItem->itemHeight = (std::max)(ScaleByDpi(34, dpi), textHeight + ScaleByDpi(14, dpi));
+        }
         return true;
     }
 
@@ -702,7 +1119,7 @@ namespace {
             return false;
         }
 
-        const MenuVisualSpec* spec = GetMenuVisualSpec(drawItem->itemID);
+        const MenuVisualSpec* spec = ResolveMenuVisualSpec(drawItem->itemID, drawItem->itemData);
         if (!spec) {
             return false;
         }
@@ -712,14 +1129,70 @@ namespace {
         RECT bounds = drawItem->rcItem;
         FillRect(hdc, &bounds, GetMenuBackgroundBrush());
 
-        RECT pill = bounds;
-        InflateRect(&pill, -ScaleByDpi(6, dpi), -ScaleByDpi(2, dpi));
-
         const bool isSelected = (drawItem->itemState & ODS_SELECTED) != 0;
         const bool isCurrentColor = spec->colorChoice && g_activeFolderMenuColor == spec->swatchColor;
         const bool isCurrentSize = spec->sizeChoice && NormalizeFolderIconSize(g_activeFolderMenuIconSize) == spec->iconSize;
+        const bool isLaunchOnStartEnabled = spec->toggleChoice && g_trayLaunchOnStartEnabled;
+        const bool isTrayItem = IsTrayMenuItem(drawItem->itemID);
 
-        if (isSelected || isCurrentColor || isCurrentSize) {
+        if (isTrayItem) {
+            HBRUSH backgroundBrush = CreateSolidBrush(TRAY_MENU_BG);
+            FillRect(hdc, &bounds, backgroundBrush);
+            DeleteObject(backgroundBrush);
+
+            const bool isActiveRow = isSelected || isLaunchOnStartEnabled;
+            if (isActiveRow) {
+                RECT highlight = bounds;
+                highlight.left += ScaleByDpi(1, dpi);
+                highlight.right -= ScaleByDpi(1, dpi);
+
+                HPEN borderPen = CreatePen(PS_SOLID, 1, TRAY_MENU_HOVER_BORDER);
+                HBRUSH fillBrush = CreateSolidBrush(TRAY_MENU_HOVER_BG);
+                HPEN oldPen = static_cast<HPEN>(SelectObject(hdc, borderPen));
+                HBRUSH oldBrush = static_cast<HBRUSH>(SelectObject(hdc, fillBrush));
+                Rectangle(hdc, highlight.left, highlight.top, highlight.right, highlight.bottom);
+                SelectObject(hdc, oldBrush);
+                SelectObject(hdc, oldPen);
+                DeleteObject(fillBrush);
+                DeleteObject(borderPen);
+            }
+
+            RECT textRect = bounds;
+            const int gutterWidth = ScaleByDpi(28, dpi);
+            textRect.left += gutterWidth + ScaleByDpi(8, dpi);
+            textRect.right -= ScaleByDpi(12, dpi);
+
+            if (isLaunchOnStartEnabled) {
+                HPEN checkPen = CreatePen(PS_SOLID, (std::max)(2, ScaleByDpi(2, dpi)), TRAY_MENU_CHECK);
+                HPEN oldPen = static_cast<HPEN>(SelectObject(hdc, checkPen));
+                int oldRop = SetROP2(hdc, R2_COPYPEN);
+
+                const int checkLeft = bounds.left + ScaleByDpi(9, dpi);
+                const int checkTop = bounds.top + ((bounds.bottom - bounds.top) - ScaleByDpi(10, dpi)) / 2;
+                POINT checkPoints[3] = {
+                    { checkLeft, checkTop + ScaleByDpi(5, dpi) },
+                    { checkLeft + ScaleByDpi(4, dpi), checkTop + ScaleByDpi(9, dpi) },
+                    { checkLeft + ScaleByDpi(11, dpi), checkTop + ScaleByDpi(1, dpi) }
+                };
+                Polyline(hdc, checkPoints, 3);
+
+                SetROP2(hdc, oldRop);
+                SelectObject(hdc, oldPen);
+                DeleteObject(checkPen);
+            }
+
+            HFONT oldFont = static_cast<HFONT>(SelectObject(hdc, GetMenuFont()));
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, TRAY_MENU_TEXT);
+            DrawTextW(hdc, spec->label, -1, &textRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            SelectObject(hdc, oldFont);
+            return true;
+        }
+
+        RECT pill = bounds;
+        InflateRect(&pill, -ScaleByDpi(6, dpi), -ScaleByDpi(2, dpi));
+
+        if (isSelected || isCurrentColor || isCurrentSize || isLaunchOnStartEnabled) {
             const COLORREF fillColor = isSelected ? MENU_HOVER_BG : MENU_SELECTED_BG;
             const COLORREF borderColor = isSelected ? MENU_HOVER_BORDER : MENU_SELECTED_BORDER;
             HPEN hoverPen = CreatePen(PS_SOLID, 1, borderColor);
@@ -738,6 +1211,30 @@ namespace {
         RECT textRect = pill;
         textRect.left += ScaleByDpi(16, dpi);
         textRect.right -= ScaleByDpi(16, dpi);
+
+        if (spec->submenuChoice) {
+            const int arrowInset = ScaleByDpi(16, dpi);
+            const int arrowHalf = ScaleByDpi(4, dpi);
+            const int arrowX = pill.right - arrowInset;
+            const int arrowY = (pill.top + pill.bottom) / 2;
+            HPEN arrowPen = CreatePen(
+                PS_SOLID,
+                1,
+                isSelected ? MENU_HOVER_BORDER : MENU_TEXT
+            );
+            HPEN oldPen = static_cast<HPEN>(SelectObject(hdc, arrowPen));
+            int oldRop = SetROP2(hdc, R2_COPYPEN);
+
+            MoveToEx(hdc, arrowX - arrowHalf, arrowY - arrowHalf, nullptr);
+            LineTo(hdc, arrowX, arrowY);
+            LineTo(hdc, arrowX - arrowHalf, arrowY + arrowHalf);
+
+            SetROP2(hdc, oldRop);
+            SelectObject(hdc, oldPen);
+            DeleteObject(arrowPen);
+
+            textRect.right = arrowX - ScaleByDpi(10, dpi);
+        }
 
         if (spec->colorChoice) {
             RECT swatchRect = pill;
@@ -770,9 +1267,63 @@ namespace {
             textRect.left = swatchRect.right + ScaleByDpi(12, dpi);
         }
 
+        if (spec->toggleChoice) {
+            RECT toggleRect = pill;
+            const int toggleSize = ScaleByDpi(16, dpi);
+            toggleRect.left += ScaleByDpi(12, dpi);
+            toggleRect.top += ((pill.bottom - pill.top) - toggleSize) / 2;
+            toggleRect.right = toggleRect.left + toggleSize;
+            toggleRect.bottom = toggleRect.top + toggleSize;
+
+            const COLORREF toggleBorder = isLaunchOnStartEnabled ? MENU_SELECTED_BORDER : MENU_SWATCH_BORDER;
+            const COLORREF toggleFill = isLaunchOnStartEnabled ? MENU_SELECTED_BORDER : MENU_BG;
+            HPEN togglePen = CreatePen(PS_SOLID, 1, toggleBorder);
+            HBRUSH toggleBrush = CreateSolidBrush(toggleFill);
+            HPEN oldPen = static_cast<HPEN>(SelectObject(hdc, togglePen));
+            HBRUSH oldBrush = static_cast<HBRUSH>(SelectObject(hdc, toggleBrush));
+
+            RoundRect(
+                hdc,
+                toggleRect.left,
+                toggleRect.top,
+                toggleRect.right,
+                toggleRect.bottom,
+                ScaleByDpi(6, dpi),
+                ScaleByDpi(6, dpi)
+            );
+
+            SelectObject(hdc, oldBrush);
+            SelectObject(hdc, oldPen);
+            DeleteObject(toggleBrush);
+            DeleteObject(togglePen);
+
+            if (isLaunchOnStartEnabled) {
+                HPEN checkPen = CreatePen(PS_SOLID, (std::max)(2, ScaleByDpi(2, dpi)), RGB(255, 255, 255));
+                HPEN previousPen = static_cast<HPEN>(SelectObject(hdc, checkPen));
+                int previousMode = SetROP2(hdc, R2_COPYPEN);
+
+                POINT checkPoints[3] = {
+                    { toggleRect.left + ScaleByDpi(3, dpi), toggleRect.top + ScaleByDpi(8, dpi) },
+                    { toggleRect.left + ScaleByDpi(7, dpi), toggleRect.top + ScaleByDpi(12, dpi) },
+                    { toggleRect.left + ScaleByDpi(13, dpi), toggleRect.top + ScaleByDpi(4, dpi) }
+                };
+                Polyline(hdc, checkPoints, 3);
+
+                SetROP2(hdc, previousMode);
+                SelectObject(hdc, previousPen);
+                DeleteObject(checkPen);
+            }
+
+            textRect.left = toggleRect.right + ScaleByDpi(12, dpi);
+        }
+
         HFONT oldFont = static_cast<HFONT>(SelectObject(hdc, GetMenuFont()));
         SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, spec->destructive ? MENU_DANGER : ((isCurrentColor || isCurrentSize) ? MENU_SELECTED_BORDER : MENU_TEXT));
+        SetTextColor(
+            hdc,
+            spec->destructive ? MENU_DANGER
+                              : ((isCurrentColor || isCurrentSize || isLaunchOnStartEnabled) ? MENU_SELECTED_BORDER : MENU_TEXT)
+        );
         DrawTextW(hdc, spec->label, -1, &textRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         SelectObject(hdc, oldFont);
 
@@ -795,6 +1346,10 @@ namespace {
                 data.isExpanded = false;
                 WidgetManager::Instance().CreateFolder(data);
                 WidgetManager::Instance().SaveToConfig();
+                break;
+            }
+            case ID_TRAY_LAUNCH_ON_START: {
+                WidgetManager::Instance().ToggleLaunchOnStart();
                 break;
             }
             case ID_TRAY_EXIT:
@@ -822,6 +1377,18 @@ namespace {
         AppendStyledMenuItem(menu, ID_MENU_SIZE_MEDIUM);
         AppendStyledMenuItem(menu, ID_MENU_SIZE_LARGE);
         AppendStyledMenuItem(menu, ID_MENU_SIZE_XL);
+    }
+
+    HMENU CreateFolderSizeSubmenu() {
+        HMENU submenu = CreateStyledPopupMenu();
+        AppendFolderSizeMenuItems(submenu);
+        return submenu;
+    }
+
+    HMENU CreateFolderColorSubmenu() {
+        HMENU submenu = CreateStyledPopupMenu();
+        AppendFolderColorMenuItems(submenu);
+        return submenu;
     }
 
     bool ApplyFolderColorCommand(FolderWidget& widget, UINT command) {
@@ -858,16 +1425,30 @@ namespace {
         return point;
     }
 
-    bool FolderPositionOverlaps(const FolderWidget* movingWidget, int desiredX, int desiredY, int iconSize) {
-        const int movingSlotWidth = GetFolderSlotWidth(iconSize);
-        const int movingSlotHeight = GetFolderSlotHeight(iconSize);
-        const POINT clamped = ClampFolderPosition(desiredX, desiredY, iconSize);
-        RECT candidate = {
-            clamped.x - FOLDER_SLOT_GAP / 2,
-            clamped.y - FOLDER_SLOT_GAP / 2,
-            clamped.x + movingSlotWidth + FOLDER_SLOT_GAP / 2,
-            clamped.y + movingSlotHeight + FOLDER_SLOT_GAP / 2
+    RECT GetFolderCollisionRect(int posX, int posY, int iconSize) {
+        const int normalizedSize = NormalizeFolderIconSize(iconSize);
+        const int slotWidth = GetFolderSlotWidth(iconSize);
+        const int slotHeight = GetFolderSlotHeight(iconSize);
+        const int horizontalInset = (std::max)(6, MulDiv(normalizedSize, 10, 64));
+        const int topInset = (std::max)(4, MulDiv(normalizedSize, 6, 64));
+        const int labelAllowance = (std::max)(8, MulDiv(normalizedSize, 12, 64));
+
+        RECT rect = {
+            posX + horizontalInset,
+            posY + topInset,
+            posX + slotWidth - horizontalInset,
+            posY + FOLDER_ICON_PADDING + normalizedSize + labelAllowance
         };
+
+        const LONG maxBottom = posY + slotHeight - 4;
+        rect.bottom = (std::min)(rect.bottom, maxBottom);
+        InflateRect(&rect, FOLDER_COLLISION_GAP, FOLDER_COLLISION_GAP);
+        return rect;
+    }
+
+    bool FolderPositionOverlaps(const FolderWidget* movingWidget, int desiredX, int desiredY, int iconSize) {
+        const POINT clamped = ClampFolderPosition(desiredX, desiredY, iconSize);
+        RECT candidate = GetFolderCollisionRect(clamped.x, clamped.y, iconSize);
 
         for (const auto& folder : WidgetManager::Instance().GetFolders()) {
             if (movingWidget && folder.get() == movingWidget) {
@@ -875,14 +1456,7 @@ namespace {
             }
 
             const FolderData& folderData = folder->GetData();
-            const int existingSlotWidth = GetFolderSlotWidth(folderData.iconSize);
-            const int existingSlotHeight = GetFolderSlotHeight(folderData.iconSize);
-            RECT existing = {
-                folderData.posX - FOLDER_SLOT_GAP / 2,
-                folderData.posY - FOLDER_SLOT_GAP / 2,
-                folderData.posX + existingSlotWidth + FOLDER_SLOT_GAP / 2,
-                folderData.posY + existingSlotHeight + FOLDER_SLOT_GAP / 2
-            };
+            RECT existing = GetFolderCollisionRect(folderData.posX, folderData.posY, folderData.iconSize);
             RECT overlap = {};
             if (IntersectRect(&overlap, &candidate, &existing)) {
                 return true;
@@ -983,6 +1557,10 @@ FolderWidget::FolderWidget(const FolderData& data)
     , m_resizeEdges(RESIZE_EDGE_NONE)
     , m_isDragOver(false)
     , m_hoveredItemIndex(-1)
+    , m_isSelectingItems(false)
+    , m_selectionStart{ 0, 0 }
+    , m_selectionCurrent{ 0, 0 }
+    , m_selectionMoved(false)
     , m_clickedItemIndex(-1)
     , m_isLaunchAnimating(false)
     , m_scrollOffset(0)
@@ -1066,6 +1644,56 @@ RECT FolderWidget::GetPaneRect() const {
     };
 }
 
+bool FolderWidget::IsPointInPane(int x, int y) const {
+    if (!m_data.isExpanded) {
+        return false;
+    }
+
+    const RECT paneRect = GetPaneRect();
+    return x >= paneRect.left && x < paneRect.right && y >= paneRect.top && y < paneRect.bottom;
+}
+
+bool FolderWidget::TryGetItemCardRect(int itemIndex, RECT& rect) const {
+    if (!m_data.isExpanded || itemIndex < 0 || itemIndex >= static_cast<int>(m_data.items.size())) {
+        return false;
+    }
+
+    const int padding = PANE_PADDING;
+    const RECT paneRect = GetPaneRect();
+    const int itemWidth = GetItemSlotWidth();
+    const int itemHeight = GetItemRowHeight();
+    const int cardWidth = GetItemCardWidth();
+    const int cardHeight = GetItemCardHeight();
+    const int itemColumns = GetItemColumns();
+
+    const int col = itemIndex % itemColumns;
+    const int row = itemIndex / itemColumns;
+    const int ix = paneRect.left + padding + col * itemWidth + (itemWidth - cardWidth) / 2;
+    const int iy = paneRect.top + padding + row * itemHeight - m_scrollOffset;
+
+    rect = { ix, iy, ix + cardWidth, iy + cardHeight };
+    return true;
+}
+
+RECT FolderWidget::GetSelectionMarqueeRect() const {
+    RECT rect = {
+        (std::min)(m_selectionStart.x, m_selectionCurrent.x),
+        (std::min)(m_selectionStart.y, m_selectionCurrent.y),
+        (std::max)(m_selectionStart.x, m_selectionCurrent.x),
+        (std::max)(m_selectionStart.y, m_selectionCurrent.y)
+    };
+
+    if (m_data.isExpanded) {
+        const RECT paneRect = GetPaneRect();
+        rect.left = (std::max)(rect.left, paneRect.left);
+        rect.top = (std::max)(rect.top, paneRect.top);
+        rect.right = (std::min)(rect.right, paneRect.right);
+        rect.bottom = (std::min)(rect.bottom, paneRect.bottom);
+    }
+
+    return rect;
+}
+
 int FolderWidget::HitTestResizeHandle(int x, int y) const {
     if (!m_data.isExpanded) {
         return RESIZE_EDGE_NONE;
@@ -1088,30 +1716,195 @@ int FolderWidget::HitTestResizeHandle(int x, int y) const {
 
 int FolderWidget::GetItemIndexAt(int x, int y) {
     if (!m_data.isExpanded) return -1;
-    
-    const int padding = PANE_PADDING;
-    const RECT paneRect = GetPaneRect();
-    const int itemWidth = GetItemSlotWidth();
-    const int itemHeight = GetItemRowHeight();
-    const int cardWidth = GetItemCardWidth();
-    const int cardHeight = GetItemCardHeight();
-    const int visibleHeight = GetExpandedPaneHeight() - padding * 2;
-    const int itemColumns = GetItemColumns();
-    
-    for (size_t i = 0; i < m_data.items.size(); i++) {
-        int col = static_cast<int>(i) % itemColumns;
-        int row = static_cast<int>(i) / itemColumns;
-        
-        int ix = paneRect.left + padding + col * itemWidth + (itemWidth - cardWidth) / 2;
-        int iy = paneRect.top + padding + row * itemHeight - m_scrollOffset;
-        
-        if (iy + itemHeight < ICON_PADDING || iy > ICON_PADDING + GetExpandedPaneHeight()) continue;
-        
-        if (x >= ix && x < ix + cardWidth && y >= iy && y < iy + cardHeight) {
-            return (int)i;
+
+    for (int i = 0; i < static_cast<int>(m_data.items.size()); i++) {
+        RECT itemRect = {};
+        if (!TryGetItemCardRect(i, itemRect)) {
+            continue;
+        }
+
+        if (itemRect.bottom < ICON_PADDING || itemRect.top > ICON_PADDING + GetExpandedPaneHeight()) {
+            continue;
+        }
+
+        if (x >= itemRect.left && x < itemRect.right && y >= itemRect.top && y < itemRect.bottom) {
+            return i;
         }
     }
     return -1;
+}
+
+bool FolderWidget::IsItemSelected(const std::wstring& path) const {
+    return std::find(m_selectedItemPaths.begin(), m_selectedItemPaths.end(), path) != m_selectedItemPaths.end();
+}
+
+void FolderWidget::ClearItemSelection() {
+    m_selectedItemPaths.clear();
+}
+
+void FolderWidget::SelectSingleItem(const std::wstring& path) {
+    m_selectedItemPaths.clear();
+    m_selectedItemPaths.push_back(path);
+}
+
+bool FolderWidget::HasItemPath(const std::wstring& sourcePath) const {
+    for (const auto& item : m_data.items) {
+        if (_wcsicmp(item.path.c_str(), sourcePath.c_str()) == 0) {
+            return true;
+        }
+        if (!item.originalPath.empty() && _wcsicmp(item.originalPath.c_str(), sourcePath.c_str()) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool FolderWidget::TryRestoreItem(const WidgetItem& item, std::wstring* restoredPath) {
+    if (!IsManagedItem(item)) {
+        if (restoredPath) {
+            *restoredPath = item.path;
+        }
+        return true;
+    }
+
+    try {
+        if (item.type == WidgetItemType::Application) {
+            if (!item.path.empty() && GetFileAttributesW(item.path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                DeleteFileW(item.path.c_str());
+            }
+            if (restoredPath) {
+                *restoredPath = item.originalPath.empty() ? item.path : item.originalPath;
+            }
+            return true;
+        }
+
+        if (!PathExistsForType(item.path, item.type)) {
+            if (!item.originalPath.empty() && PathExistsForType(item.originalPath, item.type)) {
+                if (restoredPath) {
+                    *restoredPath = item.originalPath;
+                }
+                return true;
+            }
+            return false;
+        }
+
+        const std::wstring destinationPath = ResolveRestoreDestination(item);
+        const std::wstring finalPath = item.type == WidgetItemType::Folder
+            ? MoveDirectoryPath(item.path, destinationPath)
+            : MoveFilePath(item.path, destinationPath);
+
+        if (restoredPath) {
+            *restoredPath = finalPath;
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+void FolderWidget::ShowItemRestoreFailure(const WidgetItem& item) const {
+    const std::wstring message = L"FoldR could not restore \"" + item.name + L"\" to its original location.";
+    MessageBoxW(m_hwnd, message.c_str(), L"FoldR", MB_OK | MB_ICONWARNING);
+}
+
+void FolderWidget::RemoveSelectedItems() {
+    if (m_selectedItemPaths.empty()) {
+        return;
+    }
+
+    KillTimer(m_hwnd, 999);
+    m_isLaunchAnimating = false;
+    m_clickedItemIndex = -1;
+
+    bool removedAny = false;
+    bool hadFailure = false;
+    std::vector<std::wstring> failedSelections;
+
+    for (auto it = m_data.items.begin(); it != m_data.items.end(); ) {
+        if (!IsItemSelected(it->path)) {
+            ++it;
+            continue;
+        }
+
+        std::wstring restoredPath;
+        if (TryRestoreItem(*it, &restoredPath)) {
+            it = m_data.items.erase(it);
+            removedAny = true;
+        } else {
+            hadFailure = true;
+            failedSelections.push_back(it->path);
+            ++it;
+        }
+    }
+
+    const int padding = PANE_PADDING;
+    const int itemHeight = GetItemRowHeight();
+    const int visibleHeight = GetExpandedPaneHeight() - padding * 2;
+    const int itemColumns = GetItemColumns();
+    const int totalRows = static_cast<int>((m_data.items.size() + itemColumns - 1) / itemColumns);
+    const int totalHeight = totalRows * itemHeight;
+    const int maxScroll = (std::max)(0, totalHeight - visibleHeight);
+    m_scrollOffset = (std::min)(m_scrollOffset, maxScroll);
+
+    m_selectedItemPaths = failedSelections;
+    if (removedAny) {
+        WidgetManager::Instance().SaveToConfig();
+    }
+    Render();
+
+    if (hadFailure) {
+        MessageBoxW(m_hwnd, L"Some selected items could not be restored to their original locations.", L"FoldR", MB_OK | MB_ICONWARNING);
+    }
+}
+
+int FolderWidget::GetSelectedItemCount() const {
+    return static_cast<int>(m_selectedItemPaths.size());
+}
+
+void FolderWidget::UpdateSelectionFromMarquee() {
+    ClearItemSelection();
+
+    const RECT marquee = GetSelectionMarqueeRect();
+    if (marquee.right - marquee.left < 4 || marquee.bottom - marquee.top < 4) {
+        return;
+    }
+
+    for (int i = 0; i < static_cast<int>(m_data.items.size()); i++) {
+        RECT itemRect = {};
+        if (!TryGetItemCardRect(i, itemRect)) {
+            continue;
+        }
+
+        RECT overlap = {};
+        if (IntersectRect(&overlap, &marquee, &itemRect)) {
+            m_selectedItemPaths.push_back(m_data.items[i].path);
+        }
+    }
+}
+
+bool FolderWidget::PrepareForDeletion() {
+    bool allRestored = true;
+
+    for (auto& item : m_data.items) {
+        std::wstring restoredPath;
+        if (TryRestoreItem(item, &restoredPath)) {
+            item.path = restoredPath;
+            item.originalPath.clear();
+        } else {
+            allRestored = false;
+        }
+    }
+
+    ClearItemSelection();
+    Render();
+
+    if (!allRestored) {
+        WidgetManager::Instance().SaveToConfig();
+        MessageBoxW(m_hwnd, L"Some items could not be restored, so the folder was not deleted.", L"FoldR", MB_OK | MB_ICONWARNING);
+    }
+
+    return allRestored;
 }
 
 void FolderWidget::ShowContextMenu(int x, int y, int itemIndex) {
@@ -1120,16 +1913,26 @@ void FolderWidget::ShowContextMenu(int x, int y, int itemIndex) {
     if (itemIndex != -1) {
         g_activeFolderMenuColor = MENU_NO_COLOR;
         g_activeFolderMenuIconSize = DEFAULT_FOLDER_ICON_SIZE;
-        AppendStyledMenuItem(hMenu, ID_MENU_OPEN_LOCATION);
-        AppendStyledMenuItem(hMenu, ID_MENU_REMOVE_ITEM);
+        const WidgetItem& item = m_data.items[itemIndex];
+        const bool isGroupSelection = GetSelectedItemCount() > 1 && IsItemSelected(item.path);
+
+        if (!isGroupSelection) {
+            AppendStyledMenuItem(hMenu, ID_MENU_OPEN_LOCATION);
+        }
+        AppendStyledMenuItem(hMenu, isGroupSelection ? ID_MENU_REMOVE_SELECTED : ID_MENU_REMOVE_ITEM);
     } else {
+        HMENU sizeMenu = CreateFolderSizeSubmenu();
+        HMENU colorMenu = CreateFolderColorSubmenu();
         g_activeFolderMenuColor = m_data.color;
         g_activeFolderMenuIconSize = m_data.iconSize;
         AppendStyledMenuItem(hMenu, ID_MENU_RENAME_FOLDER);
+        if (GetSelectedItemCount() > 0) {
+            AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+            AppendStyledMenuItem(hMenu, ID_MENU_REMOVE_SELECTED);
+        }
         AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-        AppendFolderSizeMenuItems(hMenu);
-        AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-        AppendFolderColorMenuItems(hMenu);
+        AppendStyledSubmenuItem(hMenu, ID_MENU_SIZE_SUBMENU, sizeMenu);
+        AppendStyledSubmenuItem(hMenu, ID_MENU_COLOR_SUBMENU, colorMenu);
         AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
         AppendStyledMenuItem(hMenu, ID_MENU_DELETE_FOLDER);
     }
@@ -1159,10 +1962,10 @@ void FolderWidget::ShowContextMenu(int x, int y, int itemIndex) {
         }
     } else if (cmd == ID_MENU_REMOVE_ITEM) {
         if (itemIndex >= 0 && itemIndex < m_data.items.size()) {
-            m_data.items.erase(m_data.items.begin() + itemIndex);
-            WidgetManager::Instance().SaveToConfig();
-            Render();
+            RemoveItem(m_data.items[itemIndex].path);
         }
+    } else if (cmd == ID_MENU_REMOVE_SELECTED) {
+        RemoveSelectedItems();
     }
 }
 
@@ -1260,6 +2063,7 @@ void FolderWidget::SetExpanded(bool expanded) {
         return;
     }
     
+    ClearItemSelection();
     SetWindowPos(m_hwnd, nullptr, m_data.posX, m_data.posY, GetCollapsedWidth(), GetCollapsedHeight(), SWP_NOZORDER);
     Render();
 }
@@ -1267,18 +2071,38 @@ void FolderWidget::SetExpanded(bool expanded) {
 void FolderWidget::AddItem(const WidgetItem& item) {
     // Check if already exists
     for (const auto& existing : m_data.items) {
-        if (existing.path == item.path) return;
+        if (_wcsicmp(existing.path.c_str(), item.path.c_str()) == 0) return;
+        if (!item.originalPath.empty() && !existing.originalPath.empty() &&
+            _wcsicmp(existing.originalPath.c_str(), item.originalPath.c_str()) == 0) return;
+        if (!item.originalPath.empty() && _wcsicmp(existing.path.c_str(), item.originalPath.c_str()) == 0) return;
     }
     m_data.items.push_back(item);
     Render();
 }
 
 void FolderWidget::RemoveItem(const std::wstring& path) {
-    m_data.items.erase(
-        std::remove_if(m_data.items.begin(), m_data.items.end(),
-            [&path](const WidgetItem& item) { return item.path == path; }),
-        m_data.items.end()
-    );
+    auto it = std::find_if(
+        m_data.items.begin(),
+        m_data.items.end(),
+        [&path](const WidgetItem& item) {
+            return _wcsicmp(item.path.c_str(), path.c_str()) == 0;
+        });
+
+    if (it == m_data.items.end()) {
+        return;
+    }
+
+    WidgetItem item = *it;
+    if (!TryRestoreItem(item, nullptr)) {
+        ShowItemRestoreFailure(item);
+        return;
+    }
+
+    m_data.items.erase(it);
+    m_selectedItemPaths.erase(
+        std::remove(m_selectedItemPaths.begin(), m_selectedItemPaths.end(), path),
+        m_selectedItemPaths.end());
+    WidgetManager::Instance().SaveToConfig();
     Render();
 }
 
@@ -1364,7 +2188,10 @@ void FolderWidget::Render() {
     // Create GDI+ graphics
     Graphics g(hdcMem);
     g.SetSmoothingMode(SmoothingModeAntiAlias);
-    g.SetTextRenderingHint(TextRenderingHintAntiAlias);
+    g.SetPixelOffsetMode(PixelOffsetModeHighQuality);
+    g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+    g.SetCompositingQuality(CompositingQualityHighQuality);
+    g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
     
     // Clear with transparent
     g.Clear(Color(0, 0, 0, 0));
@@ -1483,16 +2310,34 @@ void FolderWidget::RenderFolderIcon(Graphics& g, int x, int y) {
     // Folder name label
     FontFamily fontFamily(L"Segoe UI");
     Font font(&fontFamily, static_cast<REAL>((std::max)(12, iconSize / 5)), FontStyleBold, UnitPixel);
-    SolidBrush shadowBrush(Color(180, 8, 12, 20));
+    SolidBrush outlineBrush(Color(210, 10, 14, 22));
+    SolidBrush shadowBrush(Color(150, 8, 12, 20));
     SolidBrush textBrush(Color(255, 248, 250, 252));
     StringFormat sf;
     sf.SetAlignment(StringAlignmentCenter);
+    sf.SetFormatFlags(StringFormatFlagsNoWrap);
     sf.SetTrimming(StringTrimmingEllipsisCharacter);
     
     RectF textRect(static_cast<REAL>(x - 8), static_cast<REAL>(y + iconSize - 4), static_cast<REAL>(iconSize + 16), 30.0f);
     RectF shadowRect = textRect;
-    shadowRect.X += 1.0f;
-    shadowRect.Y += 1.0f;
+    shadowRect.Y += 1.2f;
+    const PointF outlineOffsets[] = {
+        PointF(-1.0f, 0.0f),
+        PointF(1.0f, 0.0f),
+        PointF(0.0f, -1.0f),
+        PointF(0.0f, 1.0f),
+        PointF(-0.8f, -0.8f),
+        PointF(0.8f, -0.8f),
+        PointF(-0.8f, 0.8f),
+        PointF(0.8f, 0.8f)
+    };
+
+    for (const auto& offset : outlineOffsets) {
+        RectF outlineRect = textRect;
+        outlineRect.X += offset.X;
+        outlineRect.Y += offset.Y;
+        g.DrawString(m_data.name.c_str(), -1, &font, outlineRect, &sf, &outlineBrush);
+    }
     g.DrawString(m_data.name.c_str(), -1, &font, shadowRect, &sf, &shadowBrush);
     g.DrawString(m_data.name.c_str(), -1, &font, textRect, &sf, &textBrush);
 }
@@ -1504,15 +2349,7 @@ void FolderWidget::RenderExpandedPane(Graphics& g, int x, int y) {
     BYTE r = GetRValue(m_data.color);
     BYTE gb = GetGValue(m_data.color);
     BYTE b = GetBValue(m_data.color);
-    
-    // Glassmorphism background
-    LinearGradientBrush bgBrush(
-        Point(x, y),
-        Point(x + paneWidth, y + paneHeight),
-        Color(200, (BYTE)(r * 0.15 + 30), (BYTE)(gb * 0.15 + 30), (BYTE)(b * 0.15 + 40)),
-        Color(180, (BYTE)(r * 0.1 + 20), (BYTE)(gb * 0.1 + 20), (BYTE)(b * 0.1 + 30))
-    );
-    
+
     GraphicsPath bgPath;
     int radius = 16;
     bgPath.AddArc(x, y, radius * 2, radius * 2, 180, 90);
@@ -1520,10 +2357,15 @@ void FolderWidget::RenderExpandedPane(Graphics& g, int x, int y) {
     bgPath.AddArc(x + paneWidth - radius * 2, y + paneHeight - radius * 2, radius * 2, radius * 2, 0, 90);
     bgPath.AddArc(x, y + paneHeight - radius * 2, radius * 2, radius * 2, 90, 90);
     bgPath.CloseFigure();
-    
+
+    LinearGradientBrush bgBrush(
+        Point(x, y),
+        Point(x + paneWidth, y + paneHeight),
+        Color(200, (BYTE)(r * 0.15 + 30), (BYTE)(gb * 0.15 + 30), (BYTE)(b * 0.15 + 40)),
+        Color(180, (BYTE)(r * 0.1 + 20), (BYTE)(gb * 0.1 + 20), (BYTE)(b * 0.1 + 30))
+    );
     g.FillPath(&bgBrush, &bgPath);
-    
-    // Border
+
     Pen borderPen(Color(60, r, gb, b), 1);
     g.DrawPath(&borderPen, &bgPath);
     
@@ -1554,15 +2396,38 @@ void FolderWidget::RenderExpandedPane(Graphics& g, int x, int y) {
 
     if (m_data.items.empty()) {
         // Empty state
+        const int emptyWidth = 220;
+        const int emptyHeight = 92;
+        const int emptyX = x + (paneWidth - emptyWidth) / 2;
+        const int emptyY = y + (paneHeight - emptyHeight) / 2 - 6;
+
+        GraphicsPath emptyCardPath;
+        const int emptyRadius = 14;
+        emptyCardPath.AddArc(emptyX, emptyY, emptyRadius * 2, emptyRadius * 2, 180, 90);
+        emptyCardPath.AddArc(emptyX + emptyWidth - emptyRadius * 2, emptyY, emptyRadius * 2, emptyRadius * 2, 270, 90);
+        emptyCardPath.AddArc(emptyX + emptyWidth - emptyRadius * 2, emptyY + emptyHeight - emptyRadius * 2, emptyRadius * 2, emptyRadius * 2, 0, 90);
+        emptyCardPath.AddArc(emptyX, emptyY + emptyHeight - emptyRadius * 2, emptyRadius * 2, emptyRadius * 2, 90, 90);
+        emptyCardPath.CloseFigure();
+
+        SolidBrush emptyCardBrush(Color(20, 255, 255, 255));
+        g.FillPath(&emptyCardBrush, &emptyCardPath);
+
+        Pen emptyBorderPen(Color(42, 255, 255, 255), 1);
+        g.DrawPath(&emptyBorderPen, &emptyCardPath);
+
         FontFamily fontFamily(L"Segoe UI");
-        Font font(&fontFamily, 13, FontStyleRegular, UnitPixel);
-        SolidBrush textBrush(Color(200, 200, 200, 200));
+        Font titleFont(&fontFamily, 16, FontStyleBold, UnitPixel);
+        Font bodyFont(&fontFamily, 12, FontStyleRegular, UnitPixel);
+        SolidBrush titleBrush(Color(232, 248, 250, 252));
+        SolidBrush bodyBrush(Color(175, 220, 226, 236));
         StringFormat sf;
         sf.SetAlignment(StringAlignmentCenter);
-        sf.SetLineAlignment(StringAlignmentCenter);
-        
-        RectF textRect((float)x, (float)y, (float)paneWidth, (float)paneHeight);
-        g.DrawString(L"Drag and drop files", -1, &font, textRect, &sf, &textBrush); // Removed emoji
+        sf.SetLineAlignment(StringAlignmentNear);
+
+        RectF titleRect((float)emptyX + 18.0f, (float)emptyY + 28.0f, (float)emptyWidth - 36.0f, 24.0f);
+        RectF bodyRect((float)emptyX + 18.0f, (float)emptyY + 52.0f, (float)emptyWidth - 36.0f, 26.0f);
+        g.DrawString(L"Drop files here", -1, &titleFont, titleRect, &sf, &titleBrush);
+        g.DrawString(L"Drag items into this folder", -1, &bodyFont, bodyRect, &sf, &bodyBrush);
     } else {
         for (size_t i = 0; i < m_data.items.size(); i++) {
             int col = static_cast<int>(i) % itemColumns;
@@ -1574,7 +2439,17 @@ void FolderWidget::RenderExpandedPane(Graphics& g, int x, int y) {
             // Optimization: Don't render if out of view
             if (iy + itemHeight < y || iy > y + visibleHeight) continue;
 
-            RenderItem(g, m_data.items[i], ix, iy, cardWidth, cardHeight);
+            RenderItem(g, m_data.items[i], ix, iy, cardWidth, cardHeight, IsItemSelected(m_data.items[i].path));
+        }
+    }
+
+    if (m_isSelectingItems) {
+        const RECT marquee = GetSelectionMarqueeRect();
+        if (marquee.right > marquee.left && marquee.bottom > marquee.top) {
+            SolidBrush marqueeFill(Color(36, 72, 235, 255));
+            Pen marqueeBorder(Color(210, 72, 235, 255), 1.0f);
+            g.FillRectangle(&marqueeFill, marquee.left, marquee.top, marquee.right - marquee.left, marquee.bottom - marquee.top);
+            g.DrawRectangle(&marqueeBorder, marquee.left, marquee.top, marquee.right - marquee.left, marquee.bottom - marquee.top);
         }
     }
     
@@ -1594,11 +2469,7 @@ void FolderWidget::RenderExpandedPane(Graphics& g, int x, int y) {
     }
 }
 
-void FolderWidget::RenderItem(Graphics& g, const WidgetItem& item, int x, int y, int width, int height) {
-    BYTE r = GetRValue(m_data.color);
-    BYTE gb = GetGValue(m_data.color);
-    BYTE b = GetBValue(m_data.color);
-    
+void FolderWidget::RenderItem(Graphics& g, const WidgetItem& item, int x, int y, int width, int height, bool selected) {
     // Launch Animation Scale
     float scale = 1.0f;
     if (m_isLaunchAnimating && m_clickedItemIndex != -1 && 
@@ -1616,20 +2487,35 @@ void FolderWidget::RenderItem(Graphics& g, const WidgetItem& item, int x, int y,
     int sy = cy - sh / 2;
     x = sx; y = sy; width = sw; height = sh;
 
-    // Item background
-    SolidBrush itemBg(Color(40, r, gb, b));
+    const Color itemFill = selected
+        ? Color(180, GetRValue(ITEM_CARD_SELECTED), GetGValue(ITEM_CARD_SELECTED), GetBValue(ITEM_CARD_SELECTED))
+        : Color(144, GetRValue(ITEM_CARD_BASE), GetGValue(ITEM_CARD_BASE), GetBValue(ITEM_CARD_BASE));
     GraphicsPath itemPath;
-    int radius = 8;
+    int radius = 10;
     itemPath.AddArc(x, y, radius * 2, radius * 2, 180, 90);
     itemPath.AddArc(x + width - radius * 2, y, radius * 2, radius * 2, 270, 90);
     itemPath.AddArc(x + width - radius * 2, y + height - 20 - radius * 2, radius * 2, radius * 2, 0, 90);
     itemPath.AddArc(x, y + height - 20 - radius * 2, radius * 2, radius * 2, 90, 90);
     itemPath.CloseFigure();
     
+    SolidBrush itemBg(itemFill);
     g.FillPath(&itemBg, &itemPath);
+
+    if (selected) {
+        Pen glowPen(Color(88, GetRValue(ITEM_SELECTION_ACCENT), GetGValue(ITEM_SELECTION_ACCENT), GetBValue(ITEM_SELECTION_ACCENT)), 4.0f);
+        Pen selectionPen(Color(255, GetRValue(ITEM_SELECTION_ACCENT), GetGValue(ITEM_SELECTION_ACCENT), GetBValue(ITEM_SELECTION_ACCENT)), 2.0f);
+        g.DrawPath(&glowPen, &itemPath);
+        g.DrawPath(&selectionPen, &itemPath);
+    } else {
+        Pen baseBorder(Color(82, GetRValue(ITEM_CARD_BORDER), GetGValue(ITEM_CARD_BORDER), GetBValue(ITEM_CARD_BORDER)), 1.0f);
+        g.DrawPath(&baseBorder, &itemPath);
+    }
     
     // Draw Real Icon
     Bitmap* icon = GetIconForFile(item.path);
+    if (!icon && !item.originalPath.empty()) {
+        icon = GetIconForFile(item.originalPath);
+    }
     if (icon) {
         // Draw icon centered in the top part
         int iconSize = (std::min)(40, (std::max)(28, width - 24));
@@ -1650,30 +2536,42 @@ void FolderWidget::RenderItem(Graphics& g, const WidgetItem& item, int x, int y,
     
     // Item name
     FontFamily fontFamily(L"Segoe UI");
-    Font nameFont(&fontFamily, 10, FontStyleRegular, UnitPixel);
-    SolidBrush nameBrush(Color(255, 220, 220, 220));
-    RectF nameRect((float)x, (float)(y + height - 18), (float)width, 18.0f);
+    Font nameFont(&fontFamily, 11, FontStyleRegular, UnitPixel);
+    SolidBrush nameShadowBrush(Color(150, 8, 12, 18));
+    SolidBrush nameBrush(selected ? Color(255, 249, 252, 255) : Color(230, 214, 222, 234));
+    RectF nameRect((float)x - 4.0f, (float)(y + height - 20), (float)width + 8.0f, 20.0f);
+    RectF shadowRect = nameRect;
+    shadowRect.X += 0.6f;
+    shadowRect.Y += 0.8f;
     StringFormat sf;
     sf.SetAlignment(StringAlignmentCenter);
+    sf.SetLineAlignment(StringAlignmentNear);
+    sf.SetTrimming(StringTrimmingEllipsisCharacter);
+    sf.SetFormatFlags(StringFormatFlagsNoWrap);
     
     // Truncate name if too long
     std::wstring name = item.name;
     if (name.length() > 10) {
         name = name.substr(0, 8) + L"...";
     }
+    const TextRenderingHint previousHint = g.GetTextRenderingHint();
+    g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+    g.DrawString(name.c_str(), -1, &nameFont, shadowRect, &sf, &nameShadowBrush);
     g.DrawString(name.c_str(), -1, &nameFont, nameRect, &sf, &nameBrush);
+    g.SetTextRenderingHint(previousHint);
 }
 
 void FolderWidget::ShowContextMenu(int x, int y) {
     HMENU hMenu = CreateStyledPopupMenu();
+    HMENU sizeMenu = CreateFolderSizeSubmenu();
+    HMENU colorMenu = CreateFolderColorSubmenu();
     g_activeFolderMenuColor = m_data.color;
     g_activeFolderMenuIconSize = m_data.iconSize;
     
     AppendStyledMenuItem(hMenu, ID_MENU_RENAME_FOLDER);
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-    AppendFolderSizeMenuItems(hMenu);
-    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-    AppendFolderColorMenuItems(hMenu);
+    AppendStyledSubmenuItem(hMenu, ID_MENU_SIZE_SUBMENU, sizeMenu);
+    AppendStyledSubmenuItem(hMenu, ID_MENU_COLOR_SUBMENU, colorMenu);
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendStyledMenuItem(hMenu, ID_MENU_DELETE_FOLDER);
     
@@ -1735,6 +2633,13 @@ LRESULT CALLBACK FolderWidget::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             int y = HIWORD(lParam);
             
             int itemIndex = widget->GetItemIndexAt(x, y);
+            if (itemIndex != -1) {
+                const std::wstring& itemPath = widget->m_data.items[itemIndex].path;
+                if (!widget->IsItemSelected(itemPath)) {
+                    widget->SelectSingleItem(itemPath);
+                    widget->Render();
+                }
+            }
             
             POINT pt;
             GetCursorPos(&pt);
@@ -1835,6 +2740,8 @@ LRESULT CALLBACK FolderWidget::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
 }
 
 void FolderWidget::OnMouseDown(int x, int y, bool rightClick) {
+    (void)rightClick;
+
     // Check click on folder icon
     const int iconSize = GetIconSize();
     int folderX = m_expandLeft && m_data.isExpanded ? (ICON_PADDING + GetExpandedPaneWidth() + PANE_GAP) : ICON_PADDING;
@@ -1859,35 +2766,26 @@ void FolderWidget::OnMouseDown(int x, int y, bool rightClick) {
         m_dragMoved = false;
         SetCapture(m_hwnd);
     } else if (m_data.isExpanded) {
-        // Check click on items
-        const int padding = PANE_PADDING;
-        const RECT paneRect = GetPaneRect();
-        const int itemWidth = GetItemSlotWidth();
-        const int itemHeight = GetItemRowHeight();
-        const int cardWidth = GetItemCardWidth();
-        const int cardHeight = GetItemCardHeight();
-        const int itemColumns = GetItemColumns();
-        
-        for (size_t i = 0; i < m_data.items.size(); i++) {
-            int col = static_cast<int>(i) % itemColumns;
-            int row = static_cast<int>(i) / itemColumns;
-            
-            int ix = paneRect.left + padding + col * itemWidth + (itemWidth - cardWidth) / 2;
-            int iy = paneRect.top + padding + row * itemHeight - m_scrollOffset;
-            
-            // Check visibility
-            if (iy + itemHeight < ICON_PADDING || iy > ICON_PADDING + GetExpandedPaneHeight()) continue;
+        const int itemIndex = GetItemIndexAt(x, y);
+        if (itemIndex != -1) {
+            m_clickedItemIndex = itemIndex;
+            m_isLaunchAnimating = true;
+            Render();
+            SetTimer(m_hwnd, 999, 100, nullptr);
+            return;
+        }
 
-            if (x >= ix && x < ix + cardWidth && y >= iy && y < iy + cardHeight) {
-                // Start launch animation
-                m_clickedItemIndex = i;
-                m_isLaunchAnimating = true;
-                Render();
-                
-                // Set timer for actual launch
-                SetTimer(m_hwnd, 999, 100, nullptr);
-                return;
-            }
+        if (IsPointInPane(x, y)) {
+            KillTimer(m_hwnd, 999);
+            m_clickedItemIndex = -1;
+            m_isLaunchAnimating = false;
+            m_isSelectingItems = true;
+            m_selectionStart = { x, y };
+            m_selectionCurrent = { x, y };
+            m_selectionMoved = false;
+            ClearItemSelection();
+            SetCapture(m_hwnd);
+            Render();
         }
     }
 }
@@ -1917,6 +2815,19 @@ void FolderWidget::OnMouseUp(int x, int y) {
         m_resizeEdges = RESIZE_EDGE_NONE;
         ReleaseCapture();
         WidgetManager::Instance().SaveToConfig();
+        return;
+    }
+
+    if (m_isSelectingItems) {
+        m_selectionCurrent = { x, y };
+        if (m_selectionMoved) {
+            UpdateSelectionFromMarquee();
+        } else {
+            ClearItemSelection();
+        }
+        m_isSelectingItems = false;
+        ReleaseCapture();
+        Render();
         return;
     }
 
@@ -1958,6 +2869,17 @@ void FolderWidget::OnMouseMove(int x, int y) {
         return;
     }
 
+    if (m_isSelectingItems) {
+        m_selectionCurrent = { x, y };
+        if (!m_selectionMoved && (std::abs(m_selectionCurrent.x - m_selectionStart.x) >= 4 || std::abs(m_selectionCurrent.y - m_selectionStart.y) >= 4)) {
+            m_selectionMoved = true;
+        }
+
+        UpdateSelectionFromMarquee();
+        Render();
+        return;
+    }
+
     if (m_isDragging) {
         POINT cursorPos;
         GetCursorPos(&cursorPos);
@@ -1983,9 +2905,16 @@ void FolderWidget::OnMouseMove(int x, int y) {
 }
 
 void FolderWidget::OnDrop(const std::vector<std::wstring>& files) {
+    bool addedAny = false;
+
     for (const auto& file : files) {
+        const std::wstring fullPath = file;
+        if (HasItemPath(fullPath)) {
+            continue;
+        }
+
         // Get file name
-        std::wstring name = file;
+        std::wstring name = fullPath;
         size_t lastSlash = name.find_last_of(L"\\/");
         if (lastSlash != std::wstring::npos) {
             name = name.substr(lastSlash + 1);
@@ -1993,16 +2922,24 @@ void FolderWidget::OnDrop(const std::vector<std::wstring>& files) {
         
         // Remove extension for display
         size_t lastDot = name.find_last_of(L".");
-        if (lastDot != std::wstring::npos) {
+        if (lastDot != std::wstring::npos && GetFileAttributesW(fullPath.c_str()) != INVALID_FILE_ATTRIBUTES &&
+            (GetFileAttributesW(fullPath.c_str()) & FILE_ATTRIBUTE_DIRECTORY) == 0) {
             name = name.substr(0, lastDot);
         }
-        
-        WidgetItem item;
-        item.name = name;
-        item.path = file;
-        item.icon = L""; // Icon will be loaded dynamically
-        
-        AddItem(item);
+
+        try {
+            WidgetItem item;
+            item.name = name;
+            item.originalPath = fullPath;
+            item.type = ClassifyWidgetItemType(fullPath);
+            item.path = StoreManagedItemInFolder(fullPath, m_data.id, item.type);
+            item.icon = L"";
+            AddItem(item);
+            addedAny = true;
+        } catch (...) {
+            const std::wstring message = L"FoldR could not move \"" + name + L"\" into this folder.";
+            MessageBoxW(m_hwnd, message.c_str(), L"FoldR", MB_OK | MB_ICONWARNING);
+        }
     }
     
     // Auto-expand when items are dropped
@@ -2010,7 +2947,9 @@ void FolderWidget::OnDrop(const std::vector<std::wstring>& files) {
         SetExpanded(true);
     }
     
-    WidgetManager::Instance().SaveToConfig();
+    if (addedAny) {
+        WidgetManager::Instance().SaveToConfig();
+    }
 }
 
 // ============================================
@@ -2032,9 +2971,7 @@ void WidgetManager::Initialize(HINSTANCE hInstance) {
     
     // Ensure config directory exists
     EnsureConfigDirectory();
-    
-    // Add to Windows startup (Registry)
-    AddToStartup();
+    m_launchOnStartEnabled = IsInStartup();
     
     LoadFromConfig();
     CreateSystemTray();
@@ -2068,11 +3005,21 @@ FolderWidget* WidgetManager::CreateFolder(const FolderData& data) {
 }
 
 void WidgetManager::RemoveFolder(const std::wstring& id) {
-    m_folders.erase(
-        std::remove_if(m_folders.begin(), m_folders.end(),
-            [&id](const std::unique_ptr<FolderWidget>& w) { return w->GetData().id == id; }),
-        m_folders.end()
-    );
+    auto it = std::find_if(
+        m_folders.begin(),
+        m_folders.end(),
+        [&id](const std::unique_ptr<FolderWidget>& w) { return w->GetData().id == id; });
+
+    if (it == m_folders.end()) {
+        return;
+    }
+
+    if (!(*it)->PrepareForDeletion()) {
+        return;
+    }
+
+    DeleteFolderStoreDirectory(id);
+    m_folders.erase(it);
     SaveToConfig();
 }
 
@@ -2124,10 +3071,14 @@ void WidgetManager::LoadFromConfig() {
         
         for (const auto& item : cfg.items) {
             WidgetItem fi;
-            fi.name = item.first;
-            fi.path = item.second;
+            fi.name = item.name;
+            fi.path = item.path;
+            fi.originalPath = item.originalPath;
+            fi.type = WidgetItemTypeFromConfigValue(item.type, fi.path);
             fi.icon = L"";
-            data.items.push_back(fi);
+            if (!fi.path.empty()) {
+                data.items.push_back(fi);
+            }
         }
         
         CreateFolder(data);
@@ -2161,7 +3112,12 @@ void WidgetManager::SaveToConfig() {
         cfg.paneHeight = data.paneHeight;
         
         for (const auto& item : data.items) {
-            cfg.items.push_back({ item.name, item.path });
+            ConfigItem configItem;
+            configItem.name = item.name;
+            configItem.path = item.path;
+            configItem.originalPath = item.originalPath;
+            configItem.type = WidgetItemTypeToConfigValue(item.type);
+            cfg.items.push_back(configItem);
         }
         
         configs.push_back(cfg);
@@ -2200,6 +3156,7 @@ LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 return TRUE;
             }
             break;
+
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
@@ -2216,7 +3173,20 @@ void WidgetManager::CreateSystemTray() {
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     RegisterClassExW(&wc);
     
-    m_trayHwnd = CreateWindowExW(0, TRAY_CLASS, L"TrayWindow", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, m_hInstance, nullptr);
+    m_trayHwnd = CreateWindowExW(
+        WS_EX_TOOLWINDOW,
+        TRAY_CLASS,
+        L"TrayWindow",
+        WS_POPUP,
+        0,
+        0,
+        0,
+        0,
+        nullptr,
+        nullptr,
+        m_hInstance,
+        nullptr
+    );
     
     // Create tray icon
     ZeroMemory(&m_trayIcon, sizeof(m_trayIcon));
@@ -2245,16 +3215,22 @@ void WidgetManager::ShowTrayMenu() {
 }
 
 void WidgetManager::ShowTrayMenu(POINT anchor) {
-    HMENU hMenu = CreateStyledPopupMenu();
-
-    AppendStyledMenuItem(hMenu, ID_TRAY_NEW_FOLDER);
+    HMENU hMenu = CreatePopupMenu();
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_NEW_FOLDER, L"New Folder");
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_LAUNCH_ON_START, L"Launch on Startup");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-    AppendStyledMenuItem(hMenu, ID_TRAY_EXIT);
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"Exit FoldR");
+
+    CheckMenuItem(
+        hMenu,
+        ID_TRAY_LAUNCH_ON_START,
+        MF_BYCOMMAND | (IsInStartup() ? MF_CHECKED : MF_UNCHECKED)
+    );
 
     SetForegroundWindow(m_trayHwnd);
     UINT command = TrackPopupMenu(
         hMenu,
-        TPM_RETURNCMD | TPM_BOTTOMALIGN | TPM_LEFTALIGN | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+        TPM_RETURNCMD | TPM_NONOTIFY | TPM_BOTTOMALIGN | TPM_LEFTALIGN | TPM_RIGHTBUTTON,
         anchor.x,
         anchor.y,
         0,
@@ -2275,66 +3251,82 @@ void WidgetManager::ShowTrayMenu(POINT anchor) {
 // ============================================
 
 void WidgetManager::AddToStartup() {
-    // Registry key path for current user startup programs
-    const wchar_t* REG_RUN_KEY = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-    const wchar_t* APP_NAME = L"FolderWidget";
-    
-    // Get current exe path
-    wchar_t exePath[MAX_PATH];
-    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-    
-    HKEY hKey;
-    LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, REG_RUN_KEY, 0, KEY_SET_VALUE | KEY_QUERY_VALUE, &hKey);
-    
-    if (result == ERROR_SUCCESS) {
-        // Check if already exists
-        wchar_t existingPath[MAX_PATH] = {0};
-        DWORD size = sizeof(existingPath);
-        DWORD type;
-        
-        result = RegQueryValueExW(hKey, APP_NAME, nullptr, &type, (LPBYTE)existingPath, &size);
-        
-        if (result != ERROR_SUCCESS || wcscmp(existingPath, exePath) != 0) {
-            // Add or update registry entry
-            RegSetValueExW(hKey, APP_NAME, 0, REG_SZ, (LPBYTE)exePath, (DWORD)((wcslen(exePath) + 1) * sizeof(wchar_t)));
+    const std::wstring exePath = GetExecutablePath();
+    const std::wstring exeDirectory = GetExecutableDirectory();
+    const std::wstring shortcutPath = GetStartupShortcutPath();
+
+    IShellLinkW* shellLink = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&shellLink));
+    if (SUCCEEDED(hr) && shellLink) {
+        shellLink->SetPath(exePath.c_str());
+        shellLink->SetWorkingDirectory(exeDirectory.c_str());
+        shellLink->SetDescription(L"Launch FoldR when you sign in");
+        shellLink->SetIconLocation(exePath.c_str(), 0);
+
+        IPersistFile* persistFile = nullptr;
+        hr = shellLink->QueryInterface(IID_PPV_ARGS(&persistFile));
+        if (SUCCEEDED(hr) && persistFile) {
+            persistFile->Save(shortcutPath.c_str(), TRUE);
+            persistFile->Release();
         }
-        
-        RegCloseKey(hKey);
+
+        shellLink->Release();
     }
+
+    m_launchOnStartEnabled = IsInStartup();
+}
+
+void WidgetManager::SetLaunchOnStart(bool enabled) {
+    if (enabled) {
+        AddToStartup();
+    } else {
+        RemoveFromStartup();
+    }
+
+    m_launchOnStartEnabled = IsInStartup();
+}
+
+void WidgetManager::ToggleLaunchOnStart() {
+    const bool enable = !IsInStartup();
+    SetLaunchOnStart(enable);
+    const bool isEnabled = IsInStartup();
+    m_launchOnStartEnabled = isEnabled;
+    ShowTrayNotification(
+        isEnabled ? L"Launch on Startup enabled" : L"Launch on Startup disabled",
+        isEnabled ? L"FoldR will open when you sign in." : L"FoldR will no longer start automatically."
+    );
+}
+
+bool WidgetManager::IsLaunchOnStartEnabled() {
+    return IsInStartup();
 }
 
 void WidgetManager::RemoveFromStartup() {
-    const wchar_t* REG_RUN_KEY = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-    const wchar_t* APP_NAME = L"FolderWidget";
-    
-    HKEY hKey;
-    LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, REG_RUN_KEY, 0, KEY_SET_VALUE, &hKey);
-    
-    if (result == ERROR_SUCCESS) {
-        RegDeleteValueW(hKey, APP_NAME);
-        RegCloseKey(hKey);
-    }
+    const std::wstring shortcutPath = GetStartupShortcutPath();
+    DeleteFileW(shortcutPath.c_str());
+    RemoveStartupRegistryEntry();
+
+    m_launchOnStartEnabled = IsInStartup();
 }
 
 bool WidgetManager::IsInStartup() {
-    const wchar_t* REG_RUN_KEY = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-    const wchar_t* APP_NAME = L"FolderWidget";
-    
-    HKEY hKey;
-    LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, REG_RUN_KEY, 0, KEY_QUERY_VALUE, &hKey);
-    
-    if (result == ERROR_SUCCESS) {
-        wchar_t existingPath[MAX_PATH] = {0};
-        DWORD size = sizeof(existingPath);
-        DWORD type;
-        
-        result = RegQueryValueExW(hKey, APP_NAME, nullptr, &type, (LPBYTE)existingPath, &size);
-        RegCloseKey(hKey);
-        
-        return (result == ERROR_SUCCESS && wcslen(existingPath) > 0);
+    const std::wstring shortcutPath = GetStartupShortcutPath();
+    const DWORD attributes = GetFileAttributesW(shortcutPath.c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+        return true;
     }
-    
-    return false;
+
+    return HasStartupRegistryEntry();
+}
+
+void WidgetManager::ShowTrayNotification(const wchar_t* title, const wchar_t* message) {
+    NOTIFYICONDATAW notifyData = m_trayIcon;
+    notifyData.uFlags = NIF_INFO;
+    notifyData.dwInfoFlags = NIIF_INFO;
+    notifyData.uTimeout = 2500;
+    wcscpy_s(notifyData.szInfoTitle, title);
+    wcscpy_s(notifyData.szInfo, message);
+    Shell_NotifyIconW(NIM_MODIFY, &notifyData);
 }
 
 std::wstring WidgetManager::GetConfigPath() {
@@ -2376,5 +3368,7 @@ void WidgetManager::EnsureConfigDirectory() {
             GetFileAttributesW(oldConfigPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
             CopyFileW(oldConfigPath.c_str(), newConfigPath.c_str(), TRUE);
         }
+
+        CreateDirectoryW((configDir + L"\\store").c_str(), nullptr);
     }
 }
