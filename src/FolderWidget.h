@@ -33,6 +33,9 @@ struct FolderData {
     COLORREF color;
     int posX;
     int posY;
+    int iconSize;
+    int paneWidth;
+    int paneHeight;
     std::vector<WidgetItem> items;
     bool isExpanded;
 };
@@ -69,6 +72,8 @@ public:
     
     void SetColor(COLORREF color);
     void SetName(const std::wstring& name);
+    void SetIconSize(int iconSize);
+    void SetPaneSize(int paneWidth, int paneHeight);
     
     const FolderData& GetData() const { return m_data; }
     HWND GetHwnd() const { return m_hwnd; }
@@ -91,6 +96,20 @@ private:
     void OnDragLeave();
     void OnMouseWheel(int delta);
     void OnDrop(const std::vector<std::wstring>& files);
+    RECT GetPaneRect() const;
+    int HitTestResizeHandle(int x, int y) const;
+    int GetIconSize() const;
+    int GetCollapsedWidth() const;
+    int GetCollapsedHeight() const;
+    int GetExpandedPaneWidth() const;
+    int GetExpandedPaneHeight() const;
+    int GetExpandedWidth() const;
+    int GetExpandedHeight() const;
+    int GetItemColumns() const;
+    int GetItemSlotWidth() const;
+    int GetItemRowHeight() const;
+    int GetItemCardWidth() const;
+    int GetItemCardHeight() const;
 
     HWND m_hwnd;
     HINSTANCE m_hInstance;
@@ -98,16 +117,20 @@ private:
     
     bool m_isDragging;
     POINT m_dragStart;
+    POINT m_dragStartScreen;
+    POINT m_dragOriginPos;
+    bool m_dragMoved;
+    bool m_isResizing;
+    POINT m_resizeStartScreen;
+    int m_resizeStartPaneWidth;
+    int m_resizeStartPaneHeight;
+    int m_resizeEdges;
     bool m_isDragOver;
     int m_hoveredItemIndex;
     
     // Window dimensions
     static const int ICON_SIZE = 64;
     static const int ICON_PADDING = 16;
-    static const int EXPANDED_WIDTH = 360;
-    static const int EXPANDED_HEIGHT = 280;
-    static const int ITEM_SIZE = 72;
-    static const int ITEMS_PER_ROW = 4;
 
 private:
     Gdiplus::Bitmap* GetIconForFile(const std::wstring& path);
@@ -142,6 +165,7 @@ public:
     void CreateSystemTray();
     void RemoveSystemTray();
     void ShowTrayMenu();
+    void ShowTrayMenu(POINT anchor);
     
     const std::vector<std::unique_ptr<FolderWidget>>& GetFolders() const { return m_folders; }
 

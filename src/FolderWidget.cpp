@@ -1,72 +1,389 @@
 ﻿#include "FolderWidget.h"
 #include "Config.h"
 #include <algorithm>
+#include <climits>
 #include <cmath>
 
-// Helper InputBox implementation
-static std::wstring g_InputBuffer;
-static LRESULT CALLBACK InputBoxProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    switch(msg) {
-        case WM_CREATE: {
-            CreateWindowW(L"STATIC", L"Enter new name:", WS_VISIBLE | WS_CHILD, 10, 10, 200, 20, hwnd, NULL, NULL, NULL);
-            CreateWindowW(L"EDIT", L"", WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL, 10, 35, 260, 25, hwnd, (HMENU)100, NULL, NULL);
-            CreateWindowW(L"BUTTON", L"OK", WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON, 100, 70, 80, 25, hwnd, (HMENU)1, NULL, NULL);
-            
-            // Set init text if provided via lParam (optional, skipping for simplicity or need global)
-            return 0;
+namespace {
+    void EnsureUiAssets();
+    HICON GetAppIcon(bool smallIcon);
+    POINT FindNextFolderPosition(int iconSize);
+    POINT ClampFolderPosition(int desiredX, int desiredY, int iconSize);
+    bool FolderPositionOverlaps(const FolderWidget* movingWidget, int desiredX, int desiredY, int iconSize);
+    POINT ResolveFolderPosition(const FolderWidget* movingWidget, int desiredX, int desiredY, int iconSize);
+}
+
+// Custom rename modal
+namespace {
+    constexpr UINT ID_RENAME_EDIT = 3001;
+    constexpr UINT ID_RENAME_SAVE = 3002;
+    constexpr UINT ID_RENAME_CANCEL = 3003;
+
+    struct RenameDialogState {
+        std::wstring initialName;
+        std::wstring resultName;
+        HWND editHwnd = nullptr;
+        HWND saveHwnd = nullptr;
+        HWND cancelHwnd = nullptr;
+        HFONT titleFont = nullptr;
+        HFONT bodyFont = nullptr;
+        HFONT buttonFont = nullptr;
+        HBRUSH editBrush = nullptr;
+        bool accepted = false;
+    };
+
+    HFONT CreateDialogFont(int pixelHeight, LONG weight) {
+        LOGFONTW font = {};
+        NONCLIENTMETRICSW metrics = {};
+        metrics.cbSize = sizeof(metrics);
+
+        if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0)) {
+            font = metrics.lfMessageFont;
+        } else {
+            wcscpy_s(font.lfFaceName, L"Segoe UI");
         }
-        case WM_COMMAND: {
-            if (LOWORD(wParam) == 1) {
-                wchar_t buf[256];
-                GetDlgItemTextW(hwnd, 100, buf, 256);
-                g_InputBuffer = buf;
-                DestroyWindow(hwnd);
-            }
-            return 0;
+
+        font.lfHeight = -pixelHeight;
+        font.lfWeight = weight;
+        font.lfQuality = CLEARTYPE_QUALITY;
+        return CreateFontIndirectW(&font);
+    }
+
+    void ApplyDialogRegion(HWND hwnd, int width, int height) {
+        HRGN region = CreateRoundRectRgn(0, 0, width + 1, height + 1, 28, 28);
+        SetWindowRgn(hwnd, region, TRUE);
+    }
+
+    RECT GetRenameDialogWorkArea(HWND parent) {
+        MONITORINFO monitorInfo = {};
+        monitorInfo.cbSize = sizeof(monitorInfo);
+        HMONITOR monitor = MonitorFromWindow(parent ? parent : GetDesktopWindow(), MONITOR_DEFAULTTONEAREST);
+        if (GetMonitorInfoW(monitor, &monitorInfo)) {
+            return monitorInfo.rcWork;
         }
-        case WM_CLOSE: DestroyWindow(hwnd); return 0;
-        default: return DefWindowProcW(hwnd, msg, wParam, lParam);
+
+        RECT fallback = {};
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &fallback, 0);
+        return fallback;
     }
 }
 
-static bool ShowInputBox(HWND parent, std::wstring& outName, const std::wstring& currentName) {
-    WNDCLASSEXW wc = {0};
-    wc.cbSize = sizeof(WNDCLASSEXW);
-    wc.lpfnWndProc = InputBoxProc;
-    wc.hInstance = GetModuleHandle(NULL);
-    wc.lpszClassName = L"InputBoxClass";
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW+1);
-    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    RegisterClassExW(&wc);
-    
-    g_InputBuffer = L"";
-    
-    RECT rc; GetWindowRect(parent, &rc);
-    int x = rc.left + (rc.right - rc.left)/2 - 150;
-    int y = rc.top + (rc.bottom - rc.top)/2 - 75;
-    
-    HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, L"InputBoxClass", L"Rename", 
-        WS_VISIBLE | WS_SYSMENU | WS_CAPTION, x, y, 300, 150, parent, NULL, GetModuleHandle(NULL), NULL);
-    
-    // Set text
-    SetDlgItemTextW(hwnd, 100, currentName.c_str());
-        
-    EnableWindow(parent, FALSE);
-    
-    MSG msg;
-    while(GetMessage(&msg, NULL, 0, 0)) {
-        if (!IsWindow(hwnd)) break;
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
+static LRESULT CALLBACK InputBoxProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    constexpr COLORREF DIALOG_BG = RGB(11, 18, 32);
+    constexpr COLORREF DIALOG_BORDER = RGB(71, 85, 105);
+    constexpr COLORREF DIALOG_ACCENT = RGB(99, 102, 241);
+    constexpr COLORREF DIALOG_TEXT = RGB(241, 245, 249);
+    constexpr COLORREF DIALOG_MUTED = RGB(148, 163, 184);
+    constexpr COLORREF DIALOG_EDIT_BG = RGB(17, 24, 39);
+    constexpr COLORREF DIALOG_EDIT_BORDER = RGB(51, 65, 85);
+    constexpr COLORREF DIALOG_EDIT_BORDER_FOCUS = RGB(71, 85, 105);
+    constexpr COLORREF DIALOG_PRIMARY = RGB(79, 70, 229);
+    constexpr COLORREF DIALOG_PRIMARY_PRESSED = RGB(67, 56, 202);
+    constexpr COLORREF DIALOG_SECONDARY = RGB(30, 41, 59);
+    constexpr COLORREF DIALOG_SECONDARY_PRESSED = RGB(51, 65, 85);
+
+    auto* state = reinterpret_cast<RenameDialogState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+
+    switch (msg) {
+        case WM_NCCREATE: {
+            CREATESTRUCTW* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
+            return TRUE;
+        }
+
+        case WM_CREATE: {
+            state = reinterpret_cast<RenameDialogState*>(reinterpret_cast<CREATESTRUCTW*>(lParam)->lpCreateParams);
+            state->titleFont = CreateDialogFont(20, FW_SEMIBOLD);
+            state->bodyFont = CreateDialogFont(12, FW_NORMAL);
+            state->buttonFont = CreateDialogFont(12, FW_SEMIBOLD);
+            state->editBrush = CreateSolidBrush(DIALOG_EDIT_BG);
+
+            state->editHwnd = CreateWindowExW(
+                0,
+                L"EDIT",
+                state->initialName.c_str(),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                36, 106, 228, 20,
+                hwnd,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_RENAME_EDIT)),
+                GetModuleHandle(nullptr),
+                nullptr
+            );
+
+            SendMessageW(state->editHwnd, WM_SETFONT, reinterpret_cast<WPARAM>(state->bodyFont), TRUE);
+            SendMessageW(state->editHwnd, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(12, 12));
+            SendMessageW(state->editHwnd, EM_SETSEL, 0, -1);
+
+            state->cancelHwnd = CreateWindowW(
+                L"BUTTON",
+                L"Cancel",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                116, 140, 72, 32,
+                hwnd,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_RENAME_CANCEL)),
+                GetModuleHandle(nullptr),
+                nullptr
+            );
+
+            state->saveHwnd = CreateWindowW(
+                L"BUTTON",
+                L"Save",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                204, 140, 72, 32,
+                hwnd,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_RENAME_SAVE)),
+                GetModuleHandle(nullptr),
+                nullptr
+            );
+
+            SendMessageW(state->cancelHwnd, WM_SETFONT, reinterpret_cast<WPARAM>(state->buttonFont), TRUE);
+            SendMessageW(state->saveHwnd, WM_SETFONT, reinterpret_cast<WPARAM>(state->buttonFont), TRUE);
+
+            RECT clientRect = {};
+            GetClientRect(hwnd, &clientRect);
+            ApplyDialogRegion(hwnd, clientRect.right, clientRect.bottom);
+            SetFocus(state->editHwnd);
+            return 0;
+        }
+
+        case WM_SIZE:
+            ApplyDialogRegion(hwnd, LOWORD(lParam), HIWORD(lParam));
+            return 0;
+
+        case WM_ERASEBKGND:
+            return 1;
+
+        case WM_CTLCOLORSTATIC: {
+            HDC hdc = reinterpret_cast<HDC>(wParam);
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, DIALOG_MUTED);
+            return reinterpret_cast<INT_PTR>(GetStockObject(NULL_BRUSH));
+        }
+
+        case WM_CTLCOLOREDIT: {
+            HDC hdc = reinterpret_cast<HDC>(wParam);
+            SetBkMode(hdc, OPAQUE);
+            SetBkColor(hdc, DIALOG_EDIT_BG);
+            SetTextColor(hdc, DIALOG_TEXT);
+            return reinterpret_cast<INT_PTR>(state->editBrush);
+        }
+
+        case WM_DRAWITEM: {
+            DRAWITEMSTRUCT* draw = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+            if (!draw || draw->CtlType != ODT_BUTTON) {
+                break;
+            }
+
+            const bool isPrimary = draw->CtlID == ID_RENAME_SAVE;
+            const bool isPressed = (draw->itemState & ODS_SELECTED) != 0;
+
+            COLORREF fill = isPrimary ? (isPressed ? DIALOG_PRIMARY_PRESSED : DIALOG_PRIMARY)
+                                      : (isPressed ? DIALOG_SECONDARY_PRESSED : DIALOG_SECONDARY);
+            COLORREF border = isPrimary ? DIALOG_PRIMARY : DIALOG_EDIT_BORDER;
+
+            HDC hdc = draw->hDC;
+            RECT rect = draw->rcItem;
+
+            HBRUSH baseBrush = CreateSolidBrush(DIALOG_BG);
+            FillRect(hdc, &rect, baseBrush);
+            DeleteObject(baseBrush);
+
+            HBRUSH fillBrush = CreateSolidBrush(fill);
+            HPEN borderPen = CreatePen(PS_SOLID, 1, border);
+            HBRUSH oldBrush = static_cast<HBRUSH>(SelectObject(hdc, fillBrush));
+            HPEN oldPen = static_cast<HPEN>(SelectObject(hdc, borderPen));
+
+            RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, 14, 14);
+
+            SelectObject(hdc, oldBrush);
+            SelectObject(hdc, oldPen);
+            DeleteObject(fillBrush);
+            DeleteObject(borderPen);
+
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, DIALOG_TEXT);
+            HFONT oldFont = static_cast<HFONT>(SelectObject(hdc, state->buttonFont));
+            DrawTextW(hdc, draw->CtlID == ID_RENAME_SAVE ? L"Save" : L"Cancel", -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            SelectObject(hdc, oldFont);
+            return TRUE;
+        }
+
+        case WM_PAINT: {
+            PAINTSTRUCT ps = {};
+            HDC hdc = BeginPaint(hwnd, &ps);
+
+            RECT client = {};
+            GetClientRect(hwnd, &client);
+
+            HBRUSH bgBrush = CreateSolidBrush(DIALOG_BG);
+            FillRect(hdc, &client, bgBrush);
+            DeleteObject(bgBrush);
+
+            HPEN borderPen = CreatePen(PS_SOLID, 1, DIALOG_BORDER);
+            HBRUSH hollowBrush = static_cast<HBRUSH>(GetStockObject(HOLLOW_BRUSH));
+            HPEN oldPen = static_cast<HPEN>(SelectObject(hdc, borderPen));
+            HBRUSH oldBrush = static_cast<HBRUSH>(SelectObject(hdc, hollowBrush));
+            RoundRect(hdc, client.left, client.top, client.right, client.bottom, 28, 28);
+            SelectObject(hdc, oldBrush);
+            SelectObject(hdc, oldPen);
+            DeleteObject(borderPen);
+
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, DIALOG_TEXT);
+
+            RECT titleRect = { 24, 26, client.right - 24, 54 };
+            HFONT oldTitleFont = static_cast<HFONT>(SelectObject(hdc, state->titleFont));
+            DrawTextW(hdc, L"Rename Folder", -1, &titleRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            SelectObject(hdc, oldTitleFont);
+
+            RECT subtitleRect = { 24, 58, client.right - 24, 76 };
+            HFONT oldBodyFont = static_cast<HFONT>(SelectObject(hdc, state->bodyFont));
+            SetTextColor(hdc, DIALOG_MUTED);
+            DrawTextW(hdc, L"Give this folder a cleaner label.", -1, &subtitleRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+            RECT labelRect = { 24, 82, client.right - 24, 96 };
+            SetTextColor(hdc, DIALOG_MUTED);
+            DrawTextW(hdc, L"Folder name", -1, &labelRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+            RECT editRect = { 24, 98, client.right - 24, 134 };
+
+            HBRUSH editPanelBrush = CreateSolidBrush(DIALOG_EDIT_BG);
+            HPEN editBorderPen = CreatePen(PS_SOLID, 1, GetFocus() == state->editHwnd ? DIALOG_EDIT_BORDER_FOCUS : DIALOG_EDIT_BORDER);
+            oldBrush = static_cast<HBRUSH>(SelectObject(hdc, editPanelBrush));
+            oldPen = static_cast<HPEN>(SelectObject(hdc, editBorderPen));
+            RoundRect(hdc, editRect.left, editRect.top, editRect.right, editRect.bottom, 10, 10);
+            SelectObject(hdc, oldBrush);
+            SelectObject(hdc, oldPen);
+            DeleteObject(editPanelBrush);
+            DeleteObject(editBorderPen);
+            SelectObject(hdc, oldBodyFont);
+
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+
+        case WM_COMMAND:
+            if (LOWORD(wParam) == ID_RENAME_SAVE) {
+                wchar_t buffer[256] = {};
+                GetWindowTextW(state->editHwnd, buffer, 256);
+                if (wcslen(buffer) > 0) {
+                    state->resultName = buffer;
+                    state->accepted = true;
+                    DestroyWindow(hwnd);
+                } else {
+                    SetFocus(state->editHwnd);
+                    SendMessageW(state->editHwnd, EM_SETSEL, 0, -1);
+                }
+                return 0;
+            }
+
+            if (LOWORD(wParam) == ID_RENAME_CANCEL) {
+                DestroyWindow(hwnd);
+                return 0;
+            }
+
+            if (LOWORD(wParam) == ID_RENAME_EDIT && (HIWORD(wParam) == EN_SETFOCUS || HIWORD(wParam) == EN_KILLFOCUS)) {
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            break;
+
+        case WM_CLOSE:
+            DestroyWindow(hwnd);
+            return 0;
     }
-    
+
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static bool ShowInputBox(HWND parent, std::wstring& outName, const std::wstring& currentName) {
+    EnsureUiAssets();
+
+    WNDCLASSEXW wc = {};
+    wc.cbSize = sizeof(WNDCLASSEXW);
+    wc.style = CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW;
+    wc.lpfnWndProc = InputBoxProc;
+    wc.hInstance = GetModuleHandle(nullptr);
+    wc.lpszClassName = L"FoldRRenameDialogClass";
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hIcon = GetAppIcon(false);
+    wc.hIconSm = GetAppIcon(true);
+
+    if (!GetClassInfoExW(wc.hInstance, wc.lpszClassName, &wc)) {
+        RegisterClassExW(&wc);
+    }
+
+    RenameDialogState state = {};
+    state.initialName = currentName;
+
+    RECT parentRect = {};
+    GetWindowRect(parent, &parentRect);
+    const int dialogWidth = 300;
+    const int dialogHeight = 180;
+    RECT workArea = GetRenameDialogWorkArea(parent);
+    int x = parentRect.left + ((parentRect.right - parentRect.left) - dialogWidth) / 2;
+    int y = parentRect.top + ((parentRect.bottom - parentRect.top) - dialogHeight) / 2;
+    const int minX = static_cast<int>(workArea.left) + 12;
+    const int maxX = static_cast<int>(workArea.right) - dialogWidth - 12;
+    const int minY = static_cast<int>(workArea.top) + 12;
+    const int maxY = static_cast<int>(workArea.bottom) - dialogHeight - 12;
+    x = (std::max)(minX, (std::min)(x, maxX));
+    y = (std::max)(minY, (std::min)(y, maxY));
+
+    HWND hwnd = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+        wc.lpszClassName,
+        L"FoldR Rename",
+        WS_POPUP | WS_CLIPCHILDREN,
+        x,
+        y,
+        dialogWidth,
+        dialogHeight,
+        parent,
+        nullptr,
+        wc.hInstance,
+        &state
+    );
+
+    if (!hwnd) {
+        return false;
+    }
+
+    EnableWindow(parent, FALSE);
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
+    SetForegroundWindow(hwnd);
+
+    MSG msg = {};
+    while (IsWindow(hwnd) && GetMessage(&msg, nullptr, 0, 0)) {
+        if (msg.hwnd == state.editHwnd && msg.message == WM_KEYDOWN) {
+            if (msg.wParam == VK_RETURN) {
+                SendMessageW(hwnd, WM_COMMAND, ID_RENAME_SAVE, 0);
+                continue;
+            }
+            if (msg.wParam == VK_ESCAPE) {
+                SendMessageW(hwnd, WM_CLOSE, 0, 0);
+                continue;
+            }
+        }
+
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
     EnableWindow(parent, TRUE);
     SetForegroundWindow(parent);
-    
-    if (!g_InputBuffer.empty()) {
-        outName = g_InputBuffer;
+
+    if (state.titleFont) DeleteObject(state.titleFont);
+    if (state.bodyFont) DeleteObject(state.bodyFont);
+    if (state.buttonFont) DeleteObject(state.buttonFont);
+    if (state.editBrush) DeleteObject(state.editBrush);
+
+    if (state.accepted) {
+        outName = state.resultName;
         return true;
     }
+
     return false;
 }
 
@@ -83,7 +400,568 @@ const wchar_t* TRAY_CLASS = L"FolderWidgetTrayClass";
 #define WM_TRAYICON (WM_USER + 1)
 #define ID_TRAY_NEW_FOLDER 1001
 #define ID_TRAY_EXIT 1002
-#define ID_TRAY_SHOW_ALL 1003
+#define ID_MENU_RENAME_FOLDER 2001
+#define ID_MENU_DELETE_FOLDER 2002
+#define ID_MENU_OPEN_LOCATION 2010
+#define ID_MENU_REMOVE_ITEM 2011
+#define ID_MENU_COLOR_AZURE 2101
+#define ID_MENU_COLOR_MINT 2102
+#define ID_MENU_COLOR_CRIMSON 2103
+#define ID_MENU_COLOR_AMBER 2104
+#define ID_MENU_COLOR_VIOLET 2105
+#define ID_MENU_COLOR_ROSE 2106
+#define ID_MENU_COLOR_CYAN 2107
+#define ID_MENU_COLOR_SLATE 2108
+#define ID_MENU_COLOR_LIME 2109
+#define ID_MENU_COLOR_CORAL 2110
+#define ID_MENU_SIZE_COMPACT 2201
+#define ID_MENU_SIZE_SMALL 2202
+#define ID_MENU_SIZE_MEDIUM 2203
+#define ID_MENU_SIZE_LARGE 2204
+#define ID_MENU_SIZE_XL 2205
+
+namespace {
+    constexpr wchar_t APP_TITLE[] = L"FoldR";
+    constexpr COLORREF MENU_BG = RGB(246, 248, 252);
+    constexpr COLORREF MENU_TEXT = RGB(30, 41, 59);
+    constexpr COLORREF MENU_HOVER_BG = RGB(219, 234, 254);
+    constexpr COLORREF MENU_HOVER_BORDER = RGB(147, 197, 253);
+    constexpr COLORREF MENU_SELECTED_BG = RGB(232, 240, 254);
+    constexpr COLORREF MENU_SELECTED_BORDER = RGB(96, 165, 250);
+    constexpr COLORREF MENU_DANGER = RGB(190, 24, 93);
+    constexpr COLORREF MENU_SWATCH_BORDER = RGB(203, 213, 225);
+    constexpr COLORREF MENU_NO_COLOR = 0xFFFFFFFF;
+    constexpr int DEFAULT_FOLDER_ICON_SIZE = 64;
+    constexpr int DEFAULT_PANE_WIDTH = 360;
+    constexpr int DEFAULT_PANE_HEIGHT = 280;
+    constexpr int MIN_PANE_WIDTH = 220;
+    constexpr int MIN_PANE_HEIGHT = 180;
+    constexpr int RESIZE_HANDLE_SIZE = 10;
+    constexpr int RESIZE_EDGE_NONE = 0;
+    constexpr int RESIZE_EDGE_HORIZONTAL = 1;
+    constexpr int RESIZE_EDGE_VERTICAL = 2;
+    constexpr int FOLDER_ICON_PADDING = 16;
+    constexpr int FOLDER_LABEL_EXTRA_HEIGHT = 15;
+    constexpr int FOLDER_SLOT_GAP = 12;
+    constexpr int FOLDER_SEARCH_STEP = 12;
+    constexpr int FOLDER_ICON_SIZE_PRESETS[] = { 48, 56, 64, 72, 80 };
+    constexpr int ITEM_MIN_SLOT_WIDTH = 84;
+    constexpr int ITEM_MIN_CARD_WIDTH = 56;
+    constexpr int ITEM_MAX_CARD_WIDTH = 72;
+    constexpr int ITEM_MIN_ROW_HEIGHT = 80;
+    constexpr int PANE_PADDING = 12;
+    constexpr int PANE_GAP = 8;
+
+    HICON g_appIconLarge = nullptr;
+    HICON g_appIconSmall = nullptr;
+    HFONT g_menuFont = nullptr;
+    HBRUSH g_menuBackgroundBrush = nullptr;
+    COLORREF g_activeFolderMenuColor = MENU_NO_COLOR;
+    int g_activeFolderMenuIconSize = DEFAULT_FOLDER_ICON_SIZE;
+
+    struct MenuVisualSpec {
+        UINT id;
+        const wchar_t* label;
+        bool destructive;
+        bool colorChoice;
+        COLORREF swatchColor;
+        bool sizeChoice;
+        int iconSize;
+    };
+
+    int NormalizeFolderIconSize(int iconSize) {
+        int bestSize = DEFAULT_FOLDER_ICON_SIZE;
+        int bestDistance = INT_MAX;
+
+        for (int preset : FOLDER_ICON_SIZE_PRESETS) {
+            const int distance = std::abs(iconSize - preset);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                bestSize = preset;
+            }
+        }
+
+        return bestSize;
+    }
+
+    int GetFolderSlotWidth(int iconSize) {
+        return NormalizeFolderIconSize(iconSize) + FOLDER_ICON_PADDING * 2;
+    }
+
+    int GetFolderSlotHeight(int iconSize) {
+        return NormalizeFolderIconSize(iconSize) + FOLDER_ICON_PADDING * 2 + FOLDER_LABEL_EXTRA_HEIGHT;
+    }
+
+    int ScaleByDpi(int value, int dpi) {
+        return MulDiv(value, dpi, 96);
+    }
+
+    void AddRoundedRect(GraphicsPath& path, REAL x, REAL y, REAL width, REAL height, REAL radius) {
+        REAL diameter = radius * 2.0f;
+        path.AddArc(x, y, diameter, diameter, 180.0f, 90.0f);
+        path.AddArc(x + width - diameter, y, diameter, diameter, 270.0f, 90.0f);
+        path.AddArc(x + width - diameter, y + height - diameter, diameter, diameter, 0.0f, 90.0f);
+        path.AddArc(x, y + height - diameter, diameter, diameter, 90.0f, 90.0f);
+        path.CloseFigure();
+    }
+
+    void FillRoundedRect(Graphics& graphics, const RectF& rect, REAL radius, const Color& color) {
+        GraphicsPath path;
+        AddRoundedRect(path, rect.X, rect.Y, rect.Width, rect.Height, radius);
+        SolidBrush brush(color);
+        graphics.FillPath(&brush, &path);
+    }
+
+    HICON CreateFoldRIcon(int iconSize) {
+        Bitmap bitmap(iconSize, iconSize, PixelFormat32bppARGB);
+        Graphics graphics(&bitmap);
+        graphics.SetSmoothingMode(SmoothingModeAntiAlias);
+        graphics.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+        graphics.Clear(Color(0, 0, 0, 0));
+
+        const REAL size = static_cast<REAL>(iconSize);
+        FillRoundedRect(graphics, RectF(size * 0.06f, size * 0.08f, size * 0.88f, size * 0.84f), size * 0.20f, Color(255, 241, 245, 249));
+        FillRoundedRect(graphics, RectF(size * 0.20f, size * 0.24f, size * 0.26f, size * 0.16f), size * 0.06f, Color(255, 37, 99, 235));
+        FillRoundedRect(graphics, RectF(size * 0.14f, size * 0.34f, size * 0.72f, size * 0.40f), size * 0.10f, Color(255, 245, 158, 11));
+        FillRoundedRect(graphics, RectF(size * 0.23f, size * 0.48f, size * 0.40f, size * 0.08f), size * 0.03f, Color(255, 37, 99, 235));
+
+        SolidBrush detailBrush(Color(255, 30, 41, 59));
+        graphics.FillEllipse(&detailBrush, size * 0.68f, size * 0.50f, size * 0.08f, size * 0.08f);
+
+        HICON icon = nullptr;
+        bitmap.GetHICON(&icon);
+        return icon;
+    }
+
+    Bitmap* CreateBitmapFromIcon(HICON icon, int bitmapSize) {
+        if (!icon) {
+            return nullptr;
+        }
+
+        auto bitmap = std::make_unique<Bitmap>(bitmapSize, bitmapSize, PixelFormat32bppARGB);
+        Graphics graphics(bitmap.get());
+        graphics.Clear(Color(0, 0, 0, 0));
+
+        HDC hdc = graphics.GetHDC();
+        const BOOL drawn = DrawIconEx(hdc, 0, 0, icon, bitmapSize, bitmapSize, 0, nullptr, DI_NORMAL);
+        graphics.ReleaseHDC(hdc);
+
+        if (!drawn || bitmap->GetLastStatus() != Ok) {
+            return nullptr;
+        }
+
+        return bitmap.release();
+    }
+
+    void EnsureUiAssets() {
+        if (!g_menuBackgroundBrush) {
+            g_menuBackgroundBrush = CreateSolidBrush(MENU_BG);
+        }
+
+        if (!g_menuFont) {
+            NONCLIENTMETRICSW metrics = {};
+            metrics.cbSize = sizeof(metrics);
+
+            if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0)) {
+                g_menuFont = CreateFontIndirectW(&metrics.lfMenuFont);
+            } else {
+                LOGFONTW fallback = {};
+                fallback.lfHeight = -13;
+                wcscpy_s(fallback.lfFaceName, L"Segoe UI");
+                g_menuFont = CreateFontIndirectW(&fallback);
+            }
+        }
+
+        if (!g_appIconLarge) {
+            g_appIconLarge = CreateFoldRIcon((std::max)(32, GetSystemMetrics(SM_CXICON)));
+        }
+
+        if (!g_appIconSmall) {
+            g_appIconSmall = CreateFoldRIcon((std::max)(16, GetSystemMetrics(SM_CXSMICON)));
+        }
+    }
+
+    void ReleaseUiAssets() {
+        if (g_appIconLarge) {
+            DestroyIcon(g_appIconLarge);
+            g_appIconLarge = nullptr;
+        }
+
+        if (g_appIconSmall) {
+            DestroyIcon(g_appIconSmall);
+            g_appIconSmall = nullptr;
+        }
+
+        if (g_menuFont) {
+            DeleteObject(g_menuFont);
+            g_menuFont = nullptr;
+        }
+
+        if (g_menuBackgroundBrush) {
+            DeleteObject(g_menuBackgroundBrush);
+            g_menuBackgroundBrush = nullptr;
+        }
+    }
+
+    HICON GetAppIcon(bool smallIcon) {
+        EnsureUiAssets();
+        return smallIcon ? g_appIconSmall : g_appIconLarge;
+    }
+
+    HFONT GetMenuFont() {
+        EnsureUiAssets();
+        return g_menuFont;
+    }
+
+    HBRUSH GetMenuBackgroundBrush() {
+        EnsureUiAssets();
+        return g_menuBackgroundBrush;
+    }
+
+    const MenuVisualSpec* GetMenuVisualSpec(UINT itemId) {
+        static const MenuVisualSpec specs[] = {
+            { ID_TRAY_NEW_FOLDER, L"New Folder", false, false, 0, false, 0 },
+            { ID_TRAY_EXIT, L"Exit FoldR", true, false, 0, false, 0 },
+            { ID_MENU_RENAME_FOLDER, L"Rename Folder", false, false, 0, false, 0 },
+            { ID_MENU_DELETE_FOLDER, L"Delete Folder", true, false, 0, false, 0 },
+            { ID_MENU_OPEN_LOCATION, L"Open File Location", false, false, 0, false, 0 },
+            { ID_MENU_REMOVE_ITEM, L"Remove From Folder", true, false, 0, false, 0 },
+            { ID_MENU_SIZE_COMPACT, L"Size Compact", false, false, 0, true, 48 },
+            { ID_MENU_SIZE_SMALL, L"Size Small", false, false, 0, true, 56 },
+            { ID_MENU_SIZE_MEDIUM, L"Size Medium", false, false, 0, true, 64 },
+            { ID_MENU_SIZE_LARGE, L"Size Large", false, false, 0, true, 72 },
+            { ID_MENU_SIZE_XL, L"Size XL", false, false, 0, true, 80 },
+            { ID_MENU_COLOR_AZURE, L"Azure Blue", false, true, RGB(59, 130, 246), false, 0 },
+            { ID_MENU_COLOR_MINT, L"Mint Green", false, true, RGB(34, 197, 94), false, 0 },
+            { ID_MENU_COLOR_CRIMSON, L"Crimson Red", false, true, RGB(239, 68, 68), false, 0 },
+            { ID_MENU_COLOR_AMBER, L"Amber Gold", false, true, RGB(245, 158, 11), false, 0 },
+            { ID_MENU_COLOR_VIOLET, L"Soft Violet", false, true, RGB(139, 92, 246), false, 0 },
+            { ID_MENU_COLOR_ROSE, L"Rose Pink", false, true, RGB(236, 72, 153), false, 0 },
+            { ID_MENU_COLOR_CYAN, L"Arctic Cyan", false, true, RGB(6, 182, 212), false, 0 },
+            { ID_MENU_COLOR_SLATE, L"Slate Steel", false, true, RGB(71, 85, 105), false, 0 },
+            { ID_MENU_COLOR_LIME, L"Lime Pop", false, true, RGB(132, 204, 22), false, 0 },
+            { ID_MENU_COLOR_CORAL, L"Coral Burst", false, true, RGB(249, 115, 22), false, 0 },
+        };
+
+        for (const auto& spec : specs) {
+            if (spec.id == itemId) {
+                return &spec;
+            }
+        }
+
+        return nullptr;
+    }
+
+    HMENU CreateStyledPopupMenu() {
+        HMENU menu = CreatePopupMenu();
+        MENUINFO menuInfo = { sizeof(menuInfo) };
+        menuInfo.fMask = MIM_BACKGROUND;
+        menuInfo.hbrBack = GetMenuBackgroundBrush();
+        SetMenuInfo(menu, &menuInfo);
+        return menu;
+    }
+
+    void AppendStyledMenuItem(HMENU menu, UINT itemId) {
+        const MenuVisualSpec* spec = GetMenuVisualSpec(itemId);
+        if (!spec) {
+            return;
+        }
+
+        AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, itemId, spec->label);
+    }
+
+    bool HandleStyledMenuMeasure(MEASUREITEMSTRUCT* measureItem) {
+        if (!measureItem || measureItem->CtlType != ODT_MENU) {
+            return false;
+        }
+
+        const MenuVisualSpec* spec = GetMenuVisualSpec(measureItem->itemID);
+        if (!spec) {
+            return false;
+        }
+
+        HDC screenDc = GetDC(nullptr);
+        const int dpi = GetDeviceCaps(screenDc, LOGPIXELSY);
+        HFONT oldFont = static_cast<HFONT>(SelectObject(screenDc, GetMenuFont()));
+
+        SIZE textSize = {};
+        GetTextExtentPoint32W(screenDc, spec->label, static_cast<int>(wcslen(spec->label)), &textSize);
+
+        SelectObject(screenDc, oldFont);
+        ReleaseDC(nullptr, screenDc);
+
+        const int textWidth = static_cast<int>(textSize.cx);
+        const int textHeight = static_cast<int>(textSize.cy);
+        measureItem->itemWidth = (std::max)(ScaleByDpi(196, dpi), textWidth + ScaleByDpi(40, dpi));
+        measureItem->itemHeight = (std::max)(ScaleByDpi(34, dpi), textHeight + ScaleByDpi(14, dpi));
+        return true;
+    }
+
+    bool HandleStyledMenuDraw(DRAWITEMSTRUCT* drawItem) {
+        if (!drawItem || drawItem->CtlType != ODT_MENU) {
+            return false;
+        }
+
+        const MenuVisualSpec* spec = GetMenuVisualSpec(drawItem->itemID);
+        if (!spec) {
+            return false;
+        }
+
+        HDC hdc = drawItem->hDC;
+        const int dpi = GetDeviceCaps(hdc, LOGPIXELSY);
+        RECT bounds = drawItem->rcItem;
+        FillRect(hdc, &bounds, GetMenuBackgroundBrush());
+
+        RECT pill = bounds;
+        InflateRect(&pill, -ScaleByDpi(6, dpi), -ScaleByDpi(2, dpi));
+
+        const bool isSelected = (drawItem->itemState & ODS_SELECTED) != 0;
+        const bool isCurrentColor = spec->colorChoice && g_activeFolderMenuColor == spec->swatchColor;
+        const bool isCurrentSize = spec->sizeChoice && NormalizeFolderIconSize(g_activeFolderMenuIconSize) == spec->iconSize;
+
+        if (isSelected || isCurrentColor || isCurrentSize) {
+            const COLORREF fillColor = isSelected ? MENU_HOVER_BG : MENU_SELECTED_BG;
+            const COLORREF borderColor = isSelected ? MENU_HOVER_BORDER : MENU_SELECTED_BORDER;
+            HPEN hoverPen = CreatePen(PS_SOLID, 1, borderColor);
+            HBRUSH hoverBrush = CreateSolidBrush(fillColor);
+            HPEN oldPen = static_cast<HPEN>(SelectObject(hdc, hoverPen));
+            HBRUSH oldBrush = static_cast<HBRUSH>(SelectObject(hdc, hoverBrush));
+
+            RoundRect(hdc, pill.left, pill.top, pill.right, pill.bottom, ScaleByDpi(10, dpi), ScaleByDpi(10, dpi));
+
+            SelectObject(hdc, oldBrush);
+            SelectObject(hdc, oldPen);
+            DeleteObject(hoverBrush);
+            DeleteObject(hoverPen);
+        }
+
+        RECT textRect = pill;
+        textRect.left += ScaleByDpi(16, dpi);
+        textRect.right -= ScaleByDpi(16, dpi);
+
+        if (spec->colorChoice) {
+            RECT swatchRect = pill;
+            const int swatchSize = ScaleByDpi(16, dpi);
+            swatchRect.left += ScaleByDpi(12, dpi);
+            swatchRect.top += ((pill.bottom - pill.top) - swatchSize) / 2;
+            swatchRect.right = swatchRect.left + swatchSize;
+            swatchRect.bottom = swatchRect.top + swatchSize;
+
+            HPEN swatchPen = CreatePen(PS_SOLID, isCurrentColor ? 2 : 1, isCurrentColor ? MENU_SELECTED_BORDER : MENU_SWATCH_BORDER);
+            HBRUSH swatchBrush = CreateSolidBrush(spec->swatchColor);
+            HPEN oldPen = static_cast<HPEN>(SelectObject(hdc, swatchPen));
+            HBRUSH oldBrush = static_cast<HBRUSH>(SelectObject(hdc, swatchBrush));
+
+            RoundRect(
+                hdc,
+                swatchRect.left,
+                swatchRect.top,
+                swatchRect.right,
+                swatchRect.bottom,
+                ScaleByDpi(6, dpi),
+                ScaleByDpi(6, dpi)
+            );
+
+            SelectObject(hdc, oldBrush);
+            SelectObject(hdc, oldPen);
+            DeleteObject(swatchBrush);
+            DeleteObject(swatchPen);
+
+            textRect.left = swatchRect.right + ScaleByDpi(12, dpi);
+        }
+
+        HFONT oldFont = static_cast<HFONT>(SelectObject(hdc, GetMenuFont()));
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, spec->destructive ? MENU_DANGER : ((isCurrentColor || isCurrentSize) ? MENU_SELECTED_BORDER : MENU_TEXT));
+        DrawTextW(hdc, spec->label, -1, &textRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(hdc, oldFont);
+
+        return true;
+    }
+
+    void ExecuteTrayCommand(UINT command) {
+        switch (command) {
+            case ID_TRAY_NEW_FOLDER: {
+                const POINT nextPosition = FindNextFolderPosition(DEFAULT_FOLDER_ICON_SIZE);
+                FolderData data;
+                data.id = L"folder-" + std::to_wstring(GetTickCount64());
+                data.name = L"New Folder";
+                data.color = RGB(59, 130, 246);
+                data.posX = nextPosition.x;
+                data.posY = nextPosition.y;
+                data.iconSize = DEFAULT_FOLDER_ICON_SIZE;
+                data.paneWidth = DEFAULT_PANE_WIDTH;
+                data.paneHeight = DEFAULT_PANE_HEIGHT;
+                data.isExpanded = false;
+                WidgetManager::Instance().CreateFolder(data);
+                WidgetManager::Instance().SaveToConfig();
+                break;
+            }
+            case ID_TRAY_EXIT:
+                PostQuitMessage(0);
+                break;
+        }
+    }
+
+    void AppendFolderColorMenuItems(HMENU menu) {
+        AppendStyledMenuItem(menu, ID_MENU_COLOR_AZURE);
+        AppendStyledMenuItem(menu, ID_MENU_COLOR_MINT);
+        AppendStyledMenuItem(menu, ID_MENU_COLOR_CRIMSON);
+        AppendStyledMenuItem(menu, ID_MENU_COLOR_AMBER);
+        AppendStyledMenuItem(menu, ID_MENU_COLOR_VIOLET);
+        AppendStyledMenuItem(menu, ID_MENU_COLOR_ROSE);
+        AppendStyledMenuItem(menu, ID_MENU_COLOR_CYAN);
+        AppendStyledMenuItem(menu, ID_MENU_COLOR_SLATE);
+        AppendStyledMenuItem(menu, ID_MENU_COLOR_LIME);
+        AppendStyledMenuItem(menu, ID_MENU_COLOR_CORAL);
+    }
+
+    void AppendFolderSizeMenuItems(HMENU menu) {
+        AppendStyledMenuItem(menu, ID_MENU_SIZE_COMPACT);
+        AppendStyledMenuItem(menu, ID_MENU_SIZE_SMALL);
+        AppendStyledMenuItem(menu, ID_MENU_SIZE_MEDIUM);
+        AppendStyledMenuItem(menu, ID_MENU_SIZE_LARGE);
+        AppendStyledMenuItem(menu, ID_MENU_SIZE_XL);
+    }
+
+    bool ApplyFolderColorCommand(FolderWidget& widget, UINT command) {
+        const MenuVisualSpec* spec = GetMenuVisualSpec(command);
+        if (!spec || !spec->colorChoice) {
+            return false;
+        }
+
+        widget.SetColor(spec->swatchColor);
+        WidgetManager::Instance().SaveToConfig();
+        return true;
+    }
+
+    bool ApplyFolderSizeCommand(FolderWidget& widget, UINT command) {
+        const MenuVisualSpec* spec = GetMenuVisualSpec(command);
+        if (!spec || !spec->sizeChoice) {
+            return false;
+        }
+
+        widget.SetIconSize(spec->iconSize);
+        WidgetManager::Instance().SaveToConfig();
+        return true;
+    }
+
+    POINT ClampFolderPosition(int desiredX, int desiredY, int iconSize) {
+        const int screenWidth = GetSystemMetrics(SM_CXSCREEN);
+        const int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+        const int slotWidth = GetFolderSlotWidth(iconSize);
+        const int slotHeight = GetFolderSlotHeight(iconSize);
+
+        POINT point = { desiredX, desiredY };
+        point.x = (std::max)(0L, (std::min)(point.x, static_cast<LONG>(screenWidth - slotWidth)));
+        point.y = (std::max)(0L, (std::min)(point.y, static_cast<LONG>(screenHeight - slotHeight)));
+        return point;
+    }
+
+    bool FolderPositionOverlaps(const FolderWidget* movingWidget, int desiredX, int desiredY, int iconSize) {
+        const int movingSlotWidth = GetFolderSlotWidth(iconSize);
+        const int movingSlotHeight = GetFolderSlotHeight(iconSize);
+        const POINT clamped = ClampFolderPosition(desiredX, desiredY, iconSize);
+        RECT candidate = {
+            clamped.x - FOLDER_SLOT_GAP / 2,
+            clamped.y - FOLDER_SLOT_GAP / 2,
+            clamped.x + movingSlotWidth + FOLDER_SLOT_GAP / 2,
+            clamped.y + movingSlotHeight + FOLDER_SLOT_GAP / 2
+        };
+
+        for (const auto& folder : WidgetManager::Instance().GetFolders()) {
+            if (movingWidget && folder.get() == movingWidget) {
+                continue;
+            }
+
+            const FolderData& folderData = folder->GetData();
+            const int existingSlotWidth = GetFolderSlotWidth(folderData.iconSize);
+            const int existingSlotHeight = GetFolderSlotHeight(folderData.iconSize);
+            RECT existing = {
+                folderData.posX - FOLDER_SLOT_GAP / 2,
+                folderData.posY - FOLDER_SLOT_GAP / 2,
+                folderData.posX + existingSlotWidth + FOLDER_SLOT_GAP / 2,
+                folderData.posY + existingSlotHeight + FOLDER_SLOT_GAP / 2
+            };
+            RECT overlap = {};
+            if (IntersectRect(&overlap, &candidate, &existing)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    POINT ResolveFolderPosition(const FolderWidget* movingWidget, int desiredX, int desiredY, int iconSize) {
+        POINT origin = ClampFolderPosition(desiredX, desiredY, iconSize);
+        if (!FolderPositionOverlaps(movingWidget, origin.x, origin.y, iconSize)) {
+            return origin;
+        }
+
+        bool found = false;
+        POINT best = origin;
+        long long bestDistance = 0;
+        const int screenWidth = GetSystemMetrics(SM_CXSCREEN);
+        const int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+        const int maxRadius = (std::max)(screenWidth, screenHeight);
+
+        auto considerCandidate = [&](POINT candidate) {
+            candidate = ClampFolderPosition(candidate.x, candidate.y, iconSize);
+            if (FolderPositionOverlaps(movingWidget, candidate.x, candidate.y, iconSize)) {
+                return;
+            }
+
+            const long long dx = static_cast<long long>(candidate.x) - origin.x;
+            const long long dy = static_cast<long long>(candidate.y) - origin.y;
+            const long long distance = dx * dx + dy * dy;
+
+            if (!found || distance < bestDistance) {
+                found = true;
+                best = candidate;
+                bestDistance = distance;
+            }
+        };
+
+        for (int radius = FOLDER_SEARCH_STEP; radius <= maxRadius && !found; radius += FOLDER_SEARCH_STEP) {
+            for (int dx = -radius; dx <= radius; dx += FOLDER_SEARCH_STEP) {
+                considerCandidate(POINT{ origin.x + dx, origin.y - radius });
+                considerCandidate(POINT{ origin.x + dx, origin.y + radius });
+            }
+
+            for (int dy = -radius + FOLDER_SEARCH_STEP; dy <= radius - FOLDER_SEARCH_STEP; dy += FOLDER_SEARCH_STEP) {
+                considerCandidate(POINT{ origin.x - radius, origin.y + dy });
+                considerCandidate(POINT{ origin.x + radius, origin.y + dy });
+            }
+        }
+
+        return found ? best : origin;
+    }
+
+    POINT FindNextFolderPosition(int iconSize) {
+        constexpr int startX = 28;
+        constexpr int startY = 58;
+        const int stepX = GetFolderSlotWidth(iconSize) + FOLDER_SLOT_GAP + 8;
+        const int stepY = GetFolderSlotHeight(iconSize) + 7;
+        const int widgetWidth = GetFolderSlotWidth(iconSize);
+        const int widgetHeight = GetFolderSlotHeight(iconSize);
+
+        const int screenWidth = GetSystemMetrics(SM_CXSCREEN);
+        const int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+        const int maxX = (std::max)(startX, screenWidth - widgetWidth);
+        const int maxY = (std::max)(startY, screenHeight - widgetHeight);
+
+        for (int y = startY; y <= maxY; y += stepY) {
+            for (int x = startX; x <= maxX; x += stepX) {
+                POINT candidate = ResolveFolderPosition(nullptr, x, y, iconSize);
+                if (candidate.x == x && candidate.y == y) {
+                    return POINT{ x, y };
+                }
+            }
+        }
+
+        return POINT{ startX, startY };
+    }
+}
 
 // ============================================
 // FolderWidget Implementation
@@ -94,6 +972,15 @@ FolderWidget::FolderWidget(const FolderData& data)
     , m_hInstance(nullptr)
     , m_data(data)
     , m_isDragging(false)
+    , m_dragStart{ 0, 0 }
+    , m_dragStartScreen{ 0, 0 }
+    , m_dragOriginPos{ data.posX, data.posY }
+    , m_dragMoved(false)
+    , m_isResizing(false)
+    , m_resizeStartScreen{ 0, 0 }
+    , m_resizeStartPaneWidth(0)
+    , m_resizeStartPaneHeight(0)
+    , m_resizeEdges(RESIZE_EDGE_NONE)
     , m_isDragOver(false)
     , m_hoveredItemIndex(-1)
     , m_clickedItemIndex(-1)
@@ -101,6 +988,9 @@ FolderWidget::FolderWidget(const FolderData& data)
     , m_scrollOffset(0)
     , m_expandLeft(false)
 {
+    m_data.iconSize = NormalizeFolderIconSize(m_data.iconSize);
+    m_data.paneWidth = (std::max)(MIN_PANE_WIDTH, m_data.paneWidth);
+    m_data.paneHeight = (std::max)(MIN_PANE_HEIGHT, m_data.paneHeight);
     m_data.isExpanded = false;
 }
 
@@ -115,25 +1005,109 @@ FolderWidget::~FolderWidget() {
     m_iconCache.clear();
 }
 
+int FolderWidget::GetIconSize() const {
+    return NormalizeFolderIconSize(m_data.iconSize);
+}
+
+int FolderWidget::GetCollapsedWidth() const {
+    return GetFolderSlotWidth(GetIconSize());
+}
+
+int FolderWidget::GetCollapsedHeight() const {
+    return GetFolderSlotHeight(GetIconSize());
+}
+
+int FolderWidget::GetExpandedPaneWidth() const {
+    return (std::max)(MIN_PANE_WIDTH, m_data.paneWidth);
+}
+
+int FolderWidget::GetExpandedPaneHeight() const {
+    return (std::max)(MIN_PANE_HEIGHT, m_data.paneHeight);
+}
+
+int FolderWidget::GetExpandedWidth() const {
+    return GetCollapsedWidth() + PANE_GAP + GetExpandedPaneWidth();
+}
+
+int FolderWidget::GetExpandedHeight() const {
+    return (std::max)(GetCollapsedHeight(), ICON_PADDING * 2 + GetExpandedPaneHeight());
+}
+
+int FolderWidget::GetItemColumns() const {
+    const int contentWidth = (std::max)(1, GetExpandedPaneWidth() - PANE_PADDING * 2);
+    return (std::max)(1, contentWidth / ITEM_MIN_SLOT_WIDTH);
+}
+
+int FolderWidget::GetItemSlotWidth() const {
+    const int columns = GetItemColumns();
+    const int contentWidth = (std::max)(1, GetExpandedPaneWidth() - PANE_PADDING * 2);
+    return (std::max)(contentWidth / columns, ITEM_MIN_CARD_WIDTH + 16);
+}
+
+int FolderWidget::GetItemCardWidth() const {
+    return (std::min)(ITEM_MAX_CARD_WIDTH, (std::max)(ITEM_MIN_CARD_WIDTH, GetItemSlotWidth() - 20));
+}
+
+int FolderWidget::GetItemCardHeight() const {
+    return GetItemCardWidth() + 12;
+}
+
+int FolderWidget::GetItemRowHeight() const {
+    return (std::max)(ITEM_MIN_ROW_HEIGHT, GetItemCardHeight() + 8);
+}
+
+RECT FolderWidget::GetPaneRect() const {
+    const int paneX = m_expandLeft ? ICON_PADDING : (GetCollapsedWidth() + PANE_GAP);
+    return RECT{
+        paneX,
+        ICON_PADDING,
+        paneX + GetExpandedPaneWidth(),
+        ICON_PADDING + GetExpandedPaneHeight()
+    };
+}
+
+int FolderWidget::HitTestResizeHandle(int x, int y) const {
+    if (!m_data.isExpanded) {
+        return RESIZE_EDGE_NONE;
+    }
+
+    const RECT paneRect = GetPaneRect();
+    int edges = RESIZE_EDGE_NONE;
+
+    const int horizontalEdge = m_expandLeft ? paneRect.left : paneRect.right;
+    if (y >= paneRect.top && y <= paneRect.bottom && std::abs(x - horizontalEdge) <= RESIZE_HANDLE_SIZE) {
+        edges |= RESIZE_EDGE_HORIZONTAL;
+    }
+
+    if (x >= paneRect.left && x <= paneRect.right && std::abs(y - paneRect.bottom) <= RESIZE_HANDLE_SIZE) {
+        edges |= RESIZE_EDGE_VERTICAL;
+    }
+
+    return edges;
+}
+
 int FolderWidget::GetItemIndexAt(int x, int y) {
     if (!m_data.isExpanded) return -1;
     
-    int padding = 12;
-    int paneX = m_expandLeft ? ICON_PADDING : (ICON_SIZE + ICON_PADDING * 2 + 8);
-    int itemWidth = (EXPANDED_WIDTH - padding * 2) / ITEMS_PER_ROW;
-    int itemHeight = ITEM_SIZE + 8;
-    int visibleHeight = EXPANDED_HEIGHT - padding * 2;
+    const int padding = PANE_PADDING;
+    const RECT paneRect = GetPaneRect();
+    const int itemWidth = GetItemSlotWidth();
+    const int itemHeight = GetItemRowHeight();
+    const int cardWidth = GetItemCardWidth();
+    const int cardHeight = GetItemCardHeight();
+    const int visibleHeight = GetExpandedPaneHeight() - padding * 2;
+    const int itemColumns = GetItemColumns();
     
     for (size_t i = 0; i < m_data.items.size(); i++) {
-        int col = i % ITEMS_PER_ROW;
-        int row = i / ITEMS_PER_ROW;
+        int col = static_cast<int>(i) % itemColumns;
+        int row = static_cast<int>(i) / itemColumns;
         
-        int ix = paneX + padding + col * itemWidth;
-        int iy = ICON_PADDING + padding + row * itemHeight - m_scrollOffset;
+        int ix = paneRect.left + padding + col * itemWidth + (itemWidth - cardWidth) / 2;
+        int iy = paneRect.top + padding + row * itemHeight - m_scrollOffset;
         
-        if (iy + itemHeight < ICON_PADDING || iy > ICON_PADDING + EXPANDED_HEIGHT) continue;
+        if (iy + itemHeight < ICON_PADDING || iy > ICON_PADDING + GetExpandedPaneHeight()) continue;
         
-        if (x >= ix && x < ix + itemWidth && y >= iy && y < iy + itemHeight) {
+        if (x >= ix && x < ix + cardWidth && y >= iy && y < iy + cardHeight) {
             return (int)i;
         }
     }
@@ -141,42 +1115,49 @@ int FolderWidget::GetItemIndexAt(int x, int y) {
 }
 
 void FolderWidget::ShowContextMenu(int x, int y, int itemIndex) {
-    HMENU hMenu = CreatePopupMenu();
+    HMENU hMenu = CreateStyledPopupMenu();
     
     if (itemIndex != -1) {
-        // Item specific menu
-        AppendMenuW(hMenu, MF_STRING, 10, L"📂 Open File Location");
-        AppendMenuW(hMenu, MF_STRING, 11, L"❌ Remove Item");
+        g_activeFolderMenuColor = MENU_NO_COLOR;
+        g_activeFolderMenuIconSize = DEFAULT_FOLDER_ICON_SIZE;
+        AppendStyledMenuItem(hMenu, ID_MENU_OPEN_LOCATION);
+        AppendStyledMenuItem(hMenu, ID_MENU_REMOVE_ITEM);
     } else {
-        // Folder menu
-        AppendMenuW(hMenu, MF_STRING, 1, L"✏️ Rename Folder");
+        g_activeFolderMenuColor = m_data.color;
+        g_activeFolderMenuIconSize = m_data.iconSize;
+        AppendStyledMenuItem(hMenu, ID_MENU_RENAME_FOLDER);
         AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(hMenu, MF_STRING, 2, L"❌ Delete Widget");
+        AppendFolderSizeMenuItems(hMenu);
+        AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+        AppendFolderColorMenuItems(hMenu);
+        AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+        AppendStyledMenuItem(hMenu, ID_MENU_DELETE_FOLDER);
     }
     
     SetForegroundWindow(m_hwnd);
-    int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON, x, y, 0, m_hwnd, nullptr);
+    int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, x, y, 0, m_hwnd, nullptr);
     DestroyMenu(hMenu);
+    g_activeFolderMenuColor = MENU_NO_COLOR;
+    g_activeFolderMenuIconSize = DEFAULT_FOLDER_ICON_SIZE;
+    PostMessageW(m_hwnd, WM_NULL, 0, 0);
     
-    if (cmd == 1) {
-        // Rename Dialog
+    if (cmd == ID_MENU_RENAME_FOLDER) {
         std::wstring newName;
         if (ShowInputBox(m_hwnd, newName, m_data.name)) {
             SetName(newName);
             WidgetManager::Instance().SaveToConfig();
         }
-    } else if (cmd == 2) {
-        // Delete Widget
+    } else if (ApplyFolderSizeCommand(*this, cmd) || ApplyFolderColorCommand(*this, cmd)) {
+        return;
+    } else if (cmd == ID_MENU_DELETE_FOLDER) {
         WidgetManager::Instance().RemoveFolder(m_data.id);
-    } else if (cmd == 10) {
-        // Open Location
+    } else if (cmd == ID_MENU_OPEN_LOCATION) {
         if (itemIndex >= 0 && itemIndex < m_data.items.size()) {
             std::wstring path = m_data.items[itemIndex].path;
             std::wstring folder = path.substr(0, path.find_last_of(L"\\/"));
             ShellExecuteW(nullptr, L"open", folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         }
-    } else if (cmd == 11) {
-        // Remove Item
+    } else if (cmd == ID_MENU_REMOVE_ITEM) {
         if (itemIndex >= 0 && itemIndex < m_data.items.size()) {
             m_data.items.erase(m_data.items.begin() + itemIndex);
             WidgetManager::Instance().SaveToConfig();
@@ -197,12 +1178,14 @@ bool FolderWidget::Create(HINSTANCE hInstance) {
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = nullptr;
     wc.lpszClassName = WIDGET_CLASS;
+    wc.hIcon = GetAppIcon(false);
+    wc.hIconSm = GetAppIcon(true);
     
     RegisterClassExW(&wc);
     
     // Calculate window size based on expanded state
-    int width = m_data.isExpanded ? (ICON_SIZE + ICON_PADDING * 2 + EXPANDED_WIDTH) : (ICON_SIZE + ICON_PADDING * 2);
-    int height = m_data.isExpanded ? EXPANDED_HEIGHT : (ICON_SIZE + ICON_PADDING * 2 + 15);
+    int width = m_data.isExpanded ? GetExpandedWidth() : GetCollapsedWidth();
+    int height = m_data.isExpanded ? GetExpandedHeight() : GetCollapsedHeight();
     
     // Find desktop WorkerW (the window behind desktop icons)
     HWND desktopWorker = nullptr;
@@ -253,23 +1236,15 @@ void FolderWidget::Hide() {
 }
 
 void FolderWidget::UpdatePosition(int x, int y) {
-    // Clamp to screen (Anchor point)
-    int screenW = GetSystemMetrics(SM_CXSCREEN);
-    int screenH = GetSystemMetrics(SM_CYSCREEN);
+    POINT clamped = ClampFolderPosition(x, y, GetIconSize());
+    m_data.posX = clamped.x;
+    m_data.posY = clamped.y;
     
-    if (x < 0) x = 0;
-    if (y < 0) y = 0;
-    if (x > screenW - ICON_SIZE) x = screenW - ICON_SIZE;
-    if (y > screenH - ICON_SIZE) y = screenH - ICON_SIZE;
-
-    m_data.posX = x;
-    m_data.posY = y;
-    
-    int windowX = x;
+    int windowX = clamped.x;
     if (m_data.isExpanded && m_expandLeft) {
-        windowX = x - EXPANDED_WIDTH - 8;
+        windowX = clamped.x - GetExpandedPaneWidth() - PANE_GAP;
     }
-    SetWindowPos(m_hwnd, nullptr, windowX, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+    SetWindowPos(m_hwnd, nullptr, windowX, clamped.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
 }
 
 void FolderWidget::SetExpanded(bool expanded) {
@@ -281,39 +1256,11 @@ void FolderWidget::SetExpanded(bool expanded) {
     if (expanded) {
         int screenW = GetSystemMetrics(SM_CXSCREEN);
         m_expandLeft = (m_data.posX > screenW / 2);
+        SetPaneSize(m_data.paneWidth, m_data.paneHeight);
+        return;
     }
     
-    // Resize window
-    int width = expanded ? (ICON_SIZE + ICON_PADDING * 2 + EXPANDED_WIDTH + 16) : (ICON_SIZE + ICON_PADDING * 2);
-    int height = expanded ? (EXPANDED_HEIGHT + 50) : (ICON_SIZE + ICON_PADDING * 2 + 15);
-    
-    // If expanding left, we need to shift the WINDOW position to the left
-    // But Render() expects the folder icon to be at (0,0) offset inside the window usually
-    // We will adjust Render() to draw at right-aligned offset instead
-    
-    // The window X position itself defines the top-left corner.
-    // If we expand left, our visual "anchor" (the folder icon) should effectively stay in place.
-    // So the Window X needs to move to the LEFT by the expansion amount.
-    
-    int newX = m_data.posX;
-    if (expanded && m_expandLeft) {
-        newX = m_data.posX - EXPANDED_WIDTH - 8;
-    } else if (!expanded && m_expandLeft) {
-        // When collapsing, we reset position back to the anchor
-        // actually m_data.posX stores the top-left of the FOLDER ICON essentially
-        // Wait, m_data.posX is the Window's top-left.
-        // Let's assume m_data.posX is always the Folder Icon's intended position.
-        // So window X = m_data.posX if Right, or m_data.posX - ExpandedWidth if Left.
-    }
-    
-    // Actually, simplifying: Let m_data.posX always be the top-left of the FOLDER ICON visual.
-    // So:
-    int windowX = m_data.posX;
-    if (expanded && m_expandLeft) {
-        windowX = m_data.posX - EXPANDED_WIDTH - 8;
-    }
-    
-    SetWindowPos(m_hwnd, nullptr, windowX, m_data.posY, width, height, SWP_NOZORDER);
+    SetWindowPos(m_hwnd, nullptr, m_data.posX, m_data.posY, GetCollapsedWidth(), GetCollapsedHeight(), SWP_NOZORDER);
     Render();
 }
 
@@ -354,6 +1301,42 @@ void FolderWidget::SetName(const std::wstring& name) {
     Render();
 }
 
+void FolderWidget::SetIconSize(int iconSize) {
+    const int normalizedSize = NormalizeFolderIconSize(iconSize);
+    if (m_data.iconSize == normalizedSize) {
+        return;
+    }
+
+    m_data.iconSize = normalizedSize;
+    POINT resolved = ResolveFolderPosition(this, m_data.posX, m_data.posY, m_data.iconSize);
+    m_data.posX = resolved.x;
+    m_data.posY = resolved.y;
+
+    SetPaneSize(m_data.paneWidth, m_data.paneHeight);
+}
+
+void FolderWidget::SetPaneSize(int paneWidth, int paneHeight) {
+    const int screenWidth = GetSystemMetrics(SM_CXSCREEN);
+    const int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+    const int maxPaneWidth = m_expandLeft
+        ? (std::max)(MIN_PANE_WIDTH, m_data.posX - PANE_GAP)
+        : (std::max)(MIN_PANE_WIDTH, screenWidth - m_data.posX - GetCollapsedWidth() - PANE_GAP);
+    const int maxPaneHeight = (std::max)(MIN_PANE_HEIGHT, screenHeight - m_data.posY - ICON_PADDING * 2);
+
+    m_data.paneWidth = (std::max)(MIN_PANE_WIDTH, (std::min)(paneWidth, maxPaneWidth));
+    m_data.paneHeight = (std::max)(MIN_PANE_HEIGHT, (std::min)(paneHeight, maxPaneHeight));
+
+    const int width = m_data.isExpanded ? GetExpandedWidth() : GetCollapsedWidth();
+    const int height = m_data.isExpanded ? GetExpandedHeight() : GetCollapsedHeight();
+    int windowX = m_data.posX;
+    if (m_data.isExpanded && m_expandLeft) {
+        windowX = m_data.posX - GetExpandedPaneWidth() - PANE_GAP;
+    }
+
+    SetWindowPos(m_hwnd, nullptr, windowX, m_data.posY, width, height, SWP_NOZORDER);
+    Render();
+}
+
 void FolderWidget::Render() {
     if (!m_hwnd) return;
     
@@ -387,15 +1370,16 @@ void FolderWidget::Render() {
     g.Clear(Color(0, 0, 0, 0));
     
     // Draw folder icon
+    const int iconSize = GetIconSize();
     int folderX = ICON_PADDING;
     if (m_data.isExpanded && m_expandLeft) {
-        folderX = ICON_PADDING + EXPANDED_WIDTH + 8;
+        folderX = ICON_PADDING + GetExpandedPaneWidth() + PANE_GAP;
     }
     RenderFolderIcon(g, folderX, ICON_PADDING);
     
     // Draw expanded pane if open
     if (m_data.isExpanded) {
-        int paneX = m_expandLeft ? ICON_PADDING : (ICON_SIZE + ICON_PADDING * 2 + 8);
+        int paneX = m_expandLeft ? ICON_PADDING : (GetCollapsedWidth() + PANE_GAP);
         RenderExpandedPane(g, paneX, ICON_PADDING);
     }
     
@@ -415,6 +1399,7 @@ void FolderWidget::Render() {
 }
 
 void FolderWidget::RenderFolderIcon(Graphics& g, int x, int y) {
+    const int iconSize = GetIconSize();
     BYTE r = GetRValue(m_data.color);
     BYTE gb = GetGValue(m_data.color);
     BYTE b = GetBValue(m_data.color);
@@ -422,33 +1407,35 @@ void FolderWidget::RenderFolderIcon(Graphics& g, int x, int y) {
     // Folder body
     LinearGradientBrush bodyBrush(
         Point(x, y),
-        Point(x + ICON_SIZE, y + ICON_SIZE),
+        Point(x + iconSize, y + iconSize),
         Color(230, r, gb, b),
         Color(200, (BYTE)(r * 0.7), (BYTE)(gb * 0.7), (BYTE)(b * 0.7))
     );
     
     // Folder shape
     GraphicsPath path;
-    int tabWidth = ICON_SIZE / 3;
-    int tabHeight = 8;
-    int cornerRadius = 8;
+    const int tabWidth = (std::max)(14, MulDiv(iconSize, 21, 64));
+    const int tabHeight = (std::max)(6, MulDiv(iconSize, 8, 64));
+    const int tabLift = (std::max)(5, MulDiv(iconSize, 8, 64));
+    const int cornerRadius = (std::max)(6, MulDiv(iconSize, 8, 64));
+    const int bottomInset = (std::max)(8, MulDiv(iconSize, 12, 64));
     
     // Tab
     path.AddLine(x + cornerRadius, y, x + tabWidth, y);
-    path.AddLine(x + tabWidth, y, x + tabWidth + 8, y + tabHeight);
-    path.AddLine(x + tabWidth + 8, y + tabHeight, x + ICON_SIZE - cornerRadius, y + tabHeight);
+    path.AddLine(x + tabWidth, y, x + tabWidth + tabLift, y + tabHeight);
+    path.AddLine(x + tabWidth + tabLift, y + tabHeight, x + iconSize - cornerRadius, y + tabHeight);
     
     // Right side
-    path.AddArc(x + ICON_SIZE - cornerRadius * 2, y + tabHeight, cornerRadius * 2, cornerRadius * 2, 270, 90);
-    path.AddLine(x + ICON_SIZE, y + tabHeight + cornerRadius, x + ICON_SIZE, y + ICON_SIZE - 12 - cornerRadius);
-    path.AddArc(x + ICON_SIZE - cornerRadius * 2, y + ICON_SIZE - 12 - cornerRadius * 2, cornerRadius * 2, cornerRadius * 2, 0, 90);
+    path.AddArc(x + iconSize - cornerRadius * 2, y + tabHeight, cornerRadius * 2, cornerRadius * 2, 270, 90);
+    path.AddLine(x + iconSize, y + tabHeight + cornerRadius, x + iconSize, y + iconSize - bottomInset - cornerRadius);
+    path.AddArc(x + iconSize - cornerRadius * 2, y + iconSize - bottomInset - cornerRadius * 2, cornerRadius * 2, cornerRadius * 2, 0, 90);
     
     // Bottom
-    path.AddLine(x + ICON_SIZE - cornerRadius, y + ICON_SIZE - 12, x + cornerRadius, y + ICON_SIZE - 12);
-    path.AddArc(x, y + ICON_SIZE - 12 - cornerRadius * 2, cornerRadius * 2, cornerRadius * 2, 90, 90);
+    path.AddLine(x + iconSize - cornerRadius, y + iconSize - bottomInset, x + cornerRadius, y + iconSize - bottomInset);
+    path.AddArc(x, y + iconSize - bottomInset - cornerRadius * 2, cornerRadius * 2, cornerRadius * 2, 90, 90);
     
     // Left side
-    path.AddLine(x, y + ICON_SIZE - 12 - cornerRadius, x, y + cornerRadius);
+    path.AddLine(x, y + iconSize - bottomInset - cornerRadius, x, y + cornerRadius);
     path.AddArc(x, y, cornerRadius * 2, cornerRadius * 2, 180, 90);
     
     path.CloseFigure();
@@ -456,10 +1443,16 @@ void FolderWidget::RenderFolderIcon(Graphics& g, int x, int y) {
     g.FillPath(&bodyBrush, &path);
     
     // Folder lines (content indicator)
-    Pen linePen(Color(80, 255, 255, 255), 2);
-    g.DrawLine(&linePen, x + 16, y + 28, x + ICON_SIZE - 16, y + 28);
-    g.DrawLine(&linePen, x + 20, y + 36, x + ICON_SIZE - 20, y + 36);
-    g.DrawLine(&linePen, x + 18, y + 44, x + ICON_SIZE - 18, y + 44);
+    Pen linePen(Color(80, 255, 255, 255), static_cast<REAL>((std::max)(1, MulDiv(iconSize, 2, 64))));
+    const int lineInset1 = (std::max)(8, MulDiv(iconSize, 16, 64));
+    const int lineInset2 = (std::max)(10, MulDiv(iconSize, 20, 64));
+    const int lineInset3 = (std::max)(9, MulDiv(iconSize, 18, 64));
+    const int lineY1 = y + (std::max)(18, MulDiv(iconSize, 28, 64));
+    const int lineY2 = y + (std::max)(24, MulDiv(iconSize, 36, 64));
+    const int lineY3 = y + (std::max)(30, MulDiv(iconSize, 44, 64));
+    g.DrawLine(&linePen, x + lineInset1, lineY1, x + iconSize - lineInset1, lineY1);
+    g.DrawLine(&linePen, x + lineInset2, lineY2, x + iconSize - lineInset2, lineY2);
+    g.DrawLine(&linePen, x + lineInset3, lineY3, x + iconSize - lineInset3, lineY3);
     
     // Drop shadow effect
     if (m_isDragOver) {
@@ -469,33 +1462,45 @@ void FolderWidget::RenderFolderIcon(Graphics& g, int x, int y) {
     
     // Item count badge
     if (!m_data.items.empty()) {
+        const int badgeSize = (std::max)(14, MulDiv(iconSize, 20, 64));
+        const int badgeX = x + iconSize - badgeSize + (std::max)(3, MulDiv(iconSize, 4, 64));
+        const int badgeY = y - badgeSize / 5;
         SolidBrush badgeBrush(Color(255, r, gb, b));
-        g.FillEllipse(&badgeBrush, x + ICON_SIZE - 16, y - 4, 20, 20);
+        g.FillEllipse(&badgeBrush, badgeX, badgeY, badgeSize, badgeSize);
         
         FontFamily fontFamily(L"Segoe UI");
-        Font font(&fontFamily, 10, FontStyleBold, UnitPixel);
+        Font font(&fontFamily, static_cast<REAL>((std::max)(8, MulDiv(iconSize, 10, 64))), FontStyleBold, UnitPixel);
         SolidBrush textBrush(Color(255, 255, 255, 255));
         StringFormat sf;
         sf.SetAlignment(StringAlignmentCenter);
         sf.SetLineAlignment(StringAlignmentCenter);
         
         std::wstring countStr = std::to_wstring(m_data.items.size());
-        RectF badgeRect((float)(x + ICON_SIZE - 16), (float)(y - 4), 20.0f, 20.0f);
+        RectF badgeRect(static_cast<REAL>(badgeX), static_cast<REAL>(badgeY), static_cast<REAL>(badgeSize), static_cast<REAL>(badgeSize));
         g.DrawString(countStr.c_str(), -1, &font, badgeRect, &sf, &textBrush);
     }
     
     // Folder name label
     FontFamily fontFamily(L"Segoe UI");
-    Font font(&fontFamily, 11, FontStyleRegular, UnitPixel);
-    SolidBrush textBrush(Color(255, 230, 230, 230));
+    Font font(&fontFamily, static_cast<REAL>((std::max)(12, iconSize / 5)), FontStyleBold, UnitPixel);
+    SolidBrush shadowBrush(Color(180, 8, 12, 20));
+    SolidBrush textBrush(Color(255, 248, 250, 252));
     StringFormat sf;
     sf.SetAlignment(StringAlignmentCenter);
+    sf.SetTrimming(StringTrimmingEllipsisCharacter);
     
-    RectF textRect((float)x, (float)(y + ICON_SIZE - 8), (float)ICON_SIZE, 25.0f);
+    RectF textRect(static_cast<REAL>(x - 8), static_cast<REAL>(y + iconSize - 4), static_cast<REAL>(iconSize + 16), 30.0f);
+    RectF shadowRect = textRect;
+    shadowRect.X += 1.0f;
+    shadowRect.Y += 1.0f;
+    g.DrawString(m_data.name.c_str(), -1, &font, shadowRect, &sf, &shadowBrush);
     g.DrawString(m_data.name.c_str(), -1, &font, textRect, &sf, &textBrush);
 }
 
 void FolderWidget::RenderExpandedPane(Graphics& g, int x, int y) {
+    const int paneWidth = GetExpandedPaneWidth();
+    const int paneHeight = GetExpandedPaneHeight();
+    const int itemColumns = GetItemColumns();
     BYTE r = GetRValue(m_data.color);
     BYTE gb = GetGValue(m_data.color);
     BYTE b = GetBValue(m_data.color);
@@ -503,7 +1508,7 @@ void FolderWidget::RenderExpandedPane(Graphics& g, int x, int y) {
     // Glassmorphism background
     LinearGradientBrush bgBrush(
         Point(x, y),
-        Point(x + EXPANDED_WIDTH, y + EXPANDED_HEIGHT),
+        Point(x + paneWidth, y + paneHeight),
         Color(200, (BYTE)(r * 0.15 + 30), (BYTE)(gb * 0.15 + 30), (BYTE)(b * 0.15 + 40)),
         Color(180, (BYTE)(r * 0.1 + 20), (BYTE)(gb * 0.1 + 20), (BYTE)(b * 0.1 + 30))
     );
@@ -511,9 +1516,9 @@ void FolderWidget::RenderExpandedPane(Graphics& g, int x, int y) {
     GraphicsPath bgPath;
     int radius = 16;
     bgPath.AddArc(x, y, radius * 2, radius * 2, 180, 90);
-    bgPath.AddArc(x + EXPANDED_WIDTH - radius * 2, y, radius * 2, radius * 2, 270, 90);
-    bgPath.AddArc(x + EXPANDED_WIDTH - radius * 2, y + EXPANDED_HEIGHT - radius * 2, radius * 2, radius * 2, 0, 90);
-    bgPath.AddArc(x, y + EXPANDED_HEIGHT - radius * 2, radius * 2, radius * 2, 90, 90);
+    bgPath.AddArc(x + paneWidth - radius * 2, y, radius * 2, radius * 2, 270, 90);
+    bgPath.AddArc(x + paneWidth - radius * 2, y + paneHeight - radius * 2, radius * 2, radius * 2, 0, 90);
+    bgPath.AddArc(x, y + paneHeight - radius * 2, radius * 2, radius * 2, 90, 90);
     bgPath.CloseFigure();
     
     g.FillPath(&bgBrush, &bgPath);
@@ -523,17 +1528,18 @@ void FolderWidget::RenderExpandedPane(Graphics& g, int x, int y) {
     g.DrawPath(&borderPen, &bgPath);
     
     // Items grid and Scrollbar
-    int padding = 12;
+    const int padding = PANE_PADDING;
     int itemX = x + padding;
     int itemY = y + padding;
-    int visibleHeight = EXPANDED_HEIGHT - padding * 2;
-    int contentWidth = EXPANDED_WIDTH - padding * 2;
-    int itemWidth = contentWidth / ITEMS_PER_ROW;
-    int itemHeight = ITEM_SIZE;
+    int visibleHeight = paneHeight - padding * 2;
+    const int itemWidth = GetItemSlotWidth();
+    const int itemHeight = GetItemRowHeight();
+    const int cardWidth = GetItemCardWidth();
+    const int cardHeight = GetItemCardHeight();
     
     // Calculate total height
-    int totalRows = (int)((m_data.items.size() + ITEMS_PER_ROW - 1) / ITEMS_PER_ROW);
-    int totalHeight = totalRows * (itemHeight + 8);
+    int totalRows = static_cast<int>((m_data.items.size() + itemColumns - 1) / itemColumns);
+    int totalHeight = totalRows * itemHeight;
     
     // Update scroll clamp
     int maxScroll = (std::max)(0, totalHeight - visibleHeight);
@@ -543,7 +1549,7 @@ void FolderWidget::RenderExpandedPane(Graphics& g, int x, int y) {
     // Clip to content area
     Region originalClip;
     g.GetClip(&originalClip);
-    Rect clipRect(x, y + 4, EXPANDED_WIDTH, visibleHeight); // Slightly adjusted clip
+    Rect clipRect(x, y + 4, paneWidth, visibleHeight);
     g.SetClip(clipRect);
 
     if (m_data.items.empty()) {
@@ -555,20 +1561,20 @@ void FolderWidget::RenderExpandedPane(Graphics& g, int x, int y) {
         sf.SetAlignment(StringAlignmentCenter);
         sf.SetLineAlignment(StringAlignmentCenter);
         
-        RectF textRect((float)x, (float)y, (float)EXPANDED_WIDTH, (float)EXPANDED_HEIGHT);
+        RectF textRect((float)x, (float)y, (float)paneWidth, (float)paneHeight);
         g.DrawString(L"Drag and drop files", -1, &font, textRect, &sf, &textBrush); // Removed emoji
     } else {
         for (size_t i = 0; i < m_data.items.size(); i++) {
-            int col = i % ITEMS_PER_ROW;
-            int row = i / ITEMS_PER_ROW;
+            int col = static_cast<int>(i) % itemColumns;
+            int row = static_cast<int>(i) / itemColumns;
             
-            int ix = itemX + col * itemWidth + (itemWidth - 60) / 2;
-            int iy = itemY + row * (itemHeight + 8) - m_scrollOffset;
+            int ix = itemX + col * itemWidth + (itemWidth - cardWidth) / 2;
+            int iy = itemY + row * itemHeight - m_scrollOffset;
             
             // Optimization: Don't render if out of view
             if (iy + itemHeight < y || iy > y + visibleHeight) continue;
 
-            RenderItem(g, m_data.items[i], ix, iy, 60, itemHeight);
+            RenderItem(g, m_data.items[i], ix, iy, cardWidth, cardHeight);
         }
     }
     
@@ -580,7 +1586,7 @@ void FolderWidget::RenderExpandedPane(Graphics& g, int x, int y) {
         int sbHeight = (int)((float)visibleHeight * ((float)visibleHeight / (float)totalHeight));
         if (sbHeight < 30) sbHeight = 30;
         
-        int sbX = x + EXPANDED_WIDTH - sbWidth - 4;
+        int sbX = x + paneWidth - sbWidth - 4;
         int sbY = y + padding + (int)((float)m_scrollOffset / (float)maxScroll * (visibleHeight - sbHeight));
         
         SolidBrush sbBrush(Color(100, 255, 255, 255));
@@ -626,14 +1632,14 @@ void FolderWidget::RenderItem(Graphics& g, const WidgetItem& item, int x, int y,
     Bitmap* icon = GetIconForFile(item.path);
     if (icon) {
         // Draw icon centered in the top part
-        int iconSize = 32;
+        int iconSize = (std::min)(40, (std::max)(28, width - 24));
         int iconX = x + (width - iconSize) / 2;
         int iconY = y + (height - 20 - iconSize) / 2;
         g.DrawImage(icon, iconX, iconY, iconSize, iconSize);
     } else {
         // Fallback emoji
         FontFamily fontFamily(L"Segoe UI Emoji");
-        Font iconFont(&fontFamily, 28, FontStyleRegular, UnitPixel);
+        Font iconFont(&fontFamily, static_cast<REAL>((std::min)(34, (std::max)(24, width - 24))), FontStyleRegular, UnitPixel);
         SolidBrush iconBrush(Color(255, 255, 255, 255));
         StringFormat sf;
         sf.SetAlignment(StringAlignmentCenter);
@@ -659,154 +1665,37 @@ void FolderWidget::RenderItem(Graphics& g, const WidgetItem& item, int x, int y,
 }
 
 void FolderWidget::ShowContextMenu(int x, int y) {
-    HMENU hMenu = CreatePopupMenu();
+    HMENU hMenu = CreateStyledPopupMenu();
+    g_activeFolderMenuColor = m_data.color;
+    g_activeFolderMenuIconSize = m_data.iconSize;
     
-    AppendMenuW(hMenu, MF_STRING, 1, L"✏️ Rename");
-    AppendMenuW(hMenu, MF_STRING, 2, L"🎨 Change Color");
+    AppendStyledMenuItem(hMenu, ID_MENU_RENAME_FOLDER);
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(hMenu, MF_STRING, 3, L"❌ Delete Folder");
+    AppendFolderSizeMenuItems(hMenu);
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+    AppendFolderColorMenuItems(hMenu);
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+    AppendStyledMenuItem(hMenu, ID_MENU_DELETE_FOLDER);
     
     POINT pt = { x, y };
     ClientToScreen(m_hwnd, &pt);
     
-    int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, m_hwnd, nullptr);
+    int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, pt.x, pt.y, 0, m_hwnd, nullptr);
     
     DestroyMenu(hMenu);
+    g_activeFolderMenuColor = MENU_NO_COLOR;
+    g_activeFolderMenuIconSize = DEFAULT_FOLDER_ICON_SIZE;
+    PostMessageW(m_hwnd, WM_NULL, 0, 0);
     
-    if (cmd == 1) {
-        // Simple input dialog for renaming
-        struct DialogData {
-            wchar_t buffer[256];
-        } data;
-        wcscpy_s(data.buffer, m_data.name.c_str());
-
-        // Create a simple dialog template in memory
-        // This is a bit hacky but avoids needing a .rc file
-        struct {
-            DLGTEMPLATE template_header;
-            WORD menu;
-            WORD class_name;
-            WORD title;
-            WORD point_size;
-            WCHAR font_name[14];
-        } dlg_template = {0};
-        
-        dlg_template.template_header.style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_CENTER;
-        dlg_template.template_header.dwExtendedStyle = 0;
-        dlg_template.template_header.cdit = 0;
-        dlg_template.template_header.x = 0;
-        dlg_template.template_header.y = 0;
-        dlg_template.template_header.cx = 200;
-        dlg_template.template_header.cy = 55; // Height for input + buttons
-        dlg_template.point_size = 9;
-        wcscpy_s(dlg_template.font_name, L"Segoe UI");
-
-        // We can't easily create controls without a resource file or complex in-memory template construction
-        // So for simplicity, let's use a very basic approach:
-        // Use a MessageBox to ask users (temporary) OR implement a real InputBox function manually
-        
-        // Let's implement a proper InputBox approach by creating a modal window manually
-        // Since in-memory dialog templates are complex for controls
-        
-        static wchar_t inputBuffer[256];
-        wcscpy_s(inputBuffer, m_data.name.c_str());
-        
-        // Register input window class
-        const wchar_t* INPUT_CLASS = L"FolderWidgetInput";
-        WNDCLASSEXW wc = {0};
-        wc.cbSize = sizeof(WNDCLASSEXW);
-        wc.lpfnWndProc = [](HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) -> LRESULT {
-            switch (msg) {
-                case WM_CREATE: {
-                    // Start centered
-                    int screenW = GetSystemMetrics(SM_CXSCREEN);
-                    int screenH = GetSystemMetrics(SM_CYSCREEN);
-                    SetWindowPos(hwnd, NULL, (screenW - 300) / 2, (screenH - 120) / 2, 300, 120, SWP_NOZORDER);
-                    
-                    // Create Edit control
-                    CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", (const wchar_t*)((LPCREATESTRUCT)lParam)->lpCreateParams,
-                        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 20, 20, 240, 25, hwnd, (HMENU)101, GetModuleHandle(NULL), NULL);
-                    
-                    // Create OK button
-                    CreateWindowW(L"BUTTON", L"OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-                        110, 60, 80, 25, hwnd, (HMENU)IDOK, GetModuleHandle(NULL), NULL);
-                        
-                    return 0;
-                }
-                case WM_COMMAND:
-                    if (LOWORD(wParam) == IDOK) {
-                        GetDlgItemTextW(hwnd, 101, inputBuffer, 256);
-                        PostMessage(hwnd, WM_CLOSE, 0, 0);
-                        return 0;
-                    }
-                    break;
-                case WM_CLOSE:
-                    DestroyWindow(hwnd);
-                    return 0;
-            }
-            return DefWindowProcW(hwnd, msg, wParam, lParam);
-        };
-        wc.hInstance = GetModuleHandle(nullptr);
-        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-        wc.lpszClassName = INPUT_CLASS;
-        
-        // Check if class registered, if not register it
-        if (!GetClassInfoExW(GetModuleHandle(nullptr), INPUT_CLASS, &wc)) {
-            RegisterClassExW(&wc);
+    if (cmd == ID_MENU_RENAME_FOLDER) {
+        std::wstring newName;
+        if (ShowInputBox(m_hwnd, newName, m_data.name)) {
+            SetName(newName);
+            WidgetManager::Instance().SaveToConfig();
         }
-        
-        // Create the window modal-like by disabling parent
-        HWND hInput = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, INPUT_CLASS, L"Rename Folder",
-            WS_VISIBLE | WS_POPUP | WS_CAPTION | WS_SYSMENU, 
-            0, 0, 300, 120, m_hwnd, nullptr, GetModuleHandle(nullptr), (LPVOID)inputBuffer);
-            
-        // Message loop for this window specifically (to simulate modal)
-        if (hInput) {
-            EnableWindow(m_hwnd, FALSE); // Disable parent
-            
-            MSG msg;
-            while (GetMessage(&msg, nullptr, 0, 0)) {
-                if (msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN) {
-                    // Forward Enter key to OK button
-                    SendMessage(hInput, WM_COMMAND, IDOK, 0);
-                }
-                
-                if (!IsWindow(hInput)) break;
-                TranslateMessage(&msg);
-                DispatchMessage(&msg);
-            }
-            
-            EnableWindow(m_hwnd, TRUE); // Re-enable parent
-            SetForegroundWindow(m_hwnd);
-            
-            // Apply rename if valid
-            if (wcslen(inputBuffer) > 0) {
-                SetName(inputBuffer);
-                WidgetManager::Instance().SaveToConfig();
-            }
-        }
-    } else if (cmd == 2) {
-        // Color picker - cycle through colors
-        COLORREF colors[] = {
-            RGB(59, 130, 246),  // Blue
-            RGB(34, 197, 94),   // Green
-            RGB(239, 68, 68),   // Red
-            RGB(245, 158, 11),  // Orange
-            RGB(139, 92, 246),  // Purple
-            RGB(236, 72, 153),  // Pink
-            RGB(6, 182, 212),   // Cyan
-        };
-        int numColors = sizeof(colors) / sizeof(colors[0]);
-        
-        for (int i = 0; i < numColors; i++) {
-            if (m_data.color == colors[i]) {
-                SetColor(colors[(i + 1) % numColors]);
-                return;
-            }
-        }
-        SetColor(colors[0]);
-    } else if (cmd == 3) {
-        // Delete folder
+    } else if (ApplyFolderSizeCommand(*this, cmd) || ApplyFolderColorCommand(*this, cmd)) {
+        return;
+    } else if (cmd == ID_MENU_DELETE_FOLDER) {
         WidgetManager::Instance().RemoveFolder(m_data.id);
     }
 }
@@ -861,6 +1750,30 @@ LRESULT CALLBACK FolderWidget::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             widget->OnMouseMove(x, y);
             return 0;
         }
+
+        case WM_SETCURSOR: {
+            if (LOWORD(lParam) == HTCLIENT) {
+                POINT cursorPos = {};
+                GetCursorPos(&cursorPos);
+                ScreenToClient(hwnd, &cursorPos);
+
+                const int resizeEdges = widget->m_isResizing ? widget->m_resizeEdges : widget->HitTestResizeHandle(cursorPos.x, cursorPos.y);
+                if (resizeEdges != RESIZE_EDGE_NONE) {
+                    LPCWSTR cursorId = IDC_ARROW;
+                    if (resizeEdges == (RESIZE_EDGE_HORIZONTAL | RESIZE_EDGE_VERTICAL)) {
+                        cursorId = widget->m_expandLeft ? IDC_SIZENESW : IDC_SIZENWSE;
+                    } else if ((resizeEdges & RESIZE_EDGE_HORIZONTAL) != 0) {
+                        cursorId = IDC_SIZEWE;
+                    } else if ((resizeEdges & RESIZE_EDGE_VERTICAL) != 0) {
+                        cursorId = IDC_SIZENS;
+                    }
+
+                    SetCursor(LoadCursor(nullptr, cursorId));
+                    return TRUE;
+                }
+            }
+            break;
+        }
         
         case WM_DROPFILES: {
             HDROP hDrop = reinterpret_cast<HDROP>(wParam);
@@ -901,6 +1814,18 @@ LRESULT CALLBACK FolderWidget::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             return 0;
         }
 
+        case WM_MEASUREITEM:
+            if (HandleStyledMenuMeasure(reinterpret_cast<MEASUREITEMSTRUCT*>(lParam))) {
+                return TRUE;
+            }
+            break;
+
+        case WM_DRAWITEM:
+            if (HandleStyledMenuDraw(reinterpret_cast<DRAWITEMSTRUCT*>(lParam))) {
+                return TRUE;
+            }
+            break;
+
         case WM_DESTROY: {
             return 0;
         }
@@ -911,31 +1836,49 @@ LRESULT CALLBACK FolderWidget::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
 
 void FolderWidget::OnMouseDown(int x, int y, bool rightClick) {
     // Check click on folder icon
-    int folderX = m_expandLeft && m_data.isExpanded ? (ICON_PADDING + EXPANDED_WIDTH + 8) : ICON_PADDING;
+    const int iconSize = GetIconSize();
+    int folderX = m_expandLeft && m_data.isExpanded ? (ICON_PADDING + GetExpandedPaneWidth() + PANE_GAP) : ICON_PADDING;
     int folderY = ICON_PADDING;
+
+    const int resizeEdges = HitTestResizeHandle(x, y);
+    if (resizeEdges != RESIZE_EDGE_NONE) {
+        m_isResizing = true;
+        m_resizeEdges = resizeEdges;
+        GetCursorPos(&m_resizeStartScreen);
+        m_resizeStartPaneWidth = GetExpandedPaneWidth();
+        m_resizeStartPaneHeight = GetExpandedPaneHeight();
+        SetCapture(m_hwnd);
+        return;
+    }
     
-    if (x >= folderX && x < folderX + ICON_SIZE && y >= folderY && y < folderY + ICON_SIZE) {
+    if (x >= folderX && x < folderX + iconSize && y >= folderY && y < folderY + iconSize) {
         m_isDragging = true;
         m_dragStart = { x, y };
+        GetCursorPos(&m_dragStartScreen);
+        m_dragOriginPos = { m_data.posX, m_data.posY };
+        m_dragMoved = false;
         SetCapture(m_hwnd);
     } else if (m_data.isExpanded) {
         // Check click on items
-        int padding = 12;
-        int paneX = m_expandLeft ? ICON_PADDING : (ICON_SIZE + ICON_PADDING * 2 + 8);
-        int itemWidth = (EXPANDED_WIDTH - padding * 2) / ITEMS_PER_ROW;
-        int itemHeight = ITEM_SIZE + 8;
+        const int padding = PANE_PADDING;
+        const RECT paneRect = GetPaneRect();
+        const int itemWidth = GetItemSlotWidth();
+        const int itemHeight = GetItemRowHeight();
+        const int cardWidth = GetItemCardWidth();
+        const int cardHeight = GetItemCardHeight();
+        const int itemColumns = GetItemColumns();
         
         for (size_t i = 0; i < m_data.items.size(); i++) {
-            int col = i % ITEMS_PER_ROW;
-            int row = i / ITEMS_PER_ROW;
+            int col = static_cast<int>(i) % itemColumns;
+            int row = static_cast<int>(i) / itemColumns;
             
-            int ix = paneX + padding + col * itemWidth;
-            int iy = ICON_PADDING + padding + row * itemHeight - m_scrollOffset; // Apply scroll
+            int ix = paneRect.left + padding + col * itemWidth + (itemWidth - cardWidth) / 2;
+            int iy = paneRect.top + padding + row * itemHeight - m_scrollOffset;
             
             // Check visibility
-            if (iy + itemHeight < ICON_PADDING || iy > ICON_PADDING + EXPANDED_HEIGHT) continue;
+            if (iy + itemHeight < ICON_PADDING || iy > ICON_PADDING + GetExpandedPaneHeight()) continue;
 
-            if (x >= ix && x < ix + itemWidth && y >= iy && y < iy + itemHeight) {
+            if (x >= ix && x < ix + cardWidth && y >= iy && y < iy + cardHeight) {
                 // Start launch animation
                 m_clickedItemIndex = i;
                 m_isLaunchAnimating = true;
@@ -954,10 +1897,11 @@ void FolderWidget::OnMouseWheel(int delta) {
     
     m_scrollOffset -= delta / 3; // Adjust speed
     
-    int padding = 12;
-    int itemHeight = ITEM_SIZE + 8;
-    int visibleHeight = EXPANDED_HEIGHT - padding * 2;
-    int totalRows = (int)((m_data.items.size() + ITEMS_PER_ROW - 1) / ITEMS_PER_ROW);
+    const int padding = PANE_PADDING;
+    const int itemHeight = GetItemRowHeight();
+    const int visibleHeight = GetExpandedPaneHeight() - padding * 2;
+    const int itemColumns = GetItemColumns();
+    int totalRows = (int)((m_data.items.size() + itemColumns - 1) / itemColumns);
     int totalHeight = totalRows * itemHeight;
     int maxScroll = (std::max)(0, totalHeight - visibleHeight);
     
@@ -968,13 +1912,24 @@ void FolderWidget::OnMouseWheel(int delta) {
 }
 
 void FolderWidget::OnMouseUp(int x, int y) {
+    if (m_isResizing) {
+        m_isResizing = false;
+        m_resizeEdges = RESIZE_EDGE_NONE;
+        ReleaseCapture();
+        WidgetManager::Instance().SaveToConfig();
+        return;
+    }
+
     if (m_isDragging) {
         m_isDragging = false;
         ReleaseCapture();
         
-        // If didn't move much, treat as click
-        if (std::abs(x - m_dragStart.x) < 5 && std::abs(y - m_dragStart.y) < 5) {
+        // A short press on the folder icon toggles expansion. Real drags are evaluated on drop.
+        if (!m_dragMoved) {
+            UpdatePosition(m_dragOriginPos.x, m_dragOriginPos.y);
             SetExpanded(!m_data.isExpanded);
+        } else if (FolderPositionOverlaps(this, m_data.posX, m_data.posY, m_data.iconSize)) {
+            UpdatePosition(m_dragOriginPos.x, m_dragOriginPos.y);
         }
         
         WidgetManager::Instance().SaveToConfig();
@@ -982,9 +1937,36 @@ void FolderWidget::OnMouseUp(int x, int y) {
 }
 
 void FolderWidget::OnMouseMove(int x, int y) {
+    if (m_isResizing) {
+        POINT cursorPos = {};
+        GetCursorPos(&cursorPos);
+
+        int newPaneWidth = m_resizeStartPaneWidth;
+        int newPaneHeight = m_resizeStartPaneHeight;
+
+        if ((m_resizeEdges & RESIZE_EDGE_HORIZONTAL) != 0) {
+            const int deltaX = cursorPos.x - m_resizeStartScreen.x;
+            newPaneWidth += m_expandLeft ? -deltaX : deltaX;
+        }
+
+        if ((m_resizeEdges & RESIZE_EDGE_VERTICAL) != 0) {
+            const int deltaY = cursorPos.y - m_resizeStartScreen.y;
+            newPaneHeight += deltaY;
+        }
+
+        SetPaneSize(newPaneWidth, newPaneHeight);
+        return;
+    }
+
     if (m_isDragging) {
         POINT cursorPos;
         GetCursorPos(&cursorPos);
+
+        const int dragDeltaX = cursorPos.x - m_dragStartScreen.x;
+        const int dragDeltaY = cursorPos.y - m_dragStartScreen.y;
+        if (!m_dragMoved && (std::abs(dragDeltaX) >= 6 || std::abs(dragDeltaY) >= 6)) {
+            m_dragMoved = true;
+        }
         
         int newX = cursorPos.x - m_dragStart.x;
         int newY = cursorPos.y - m_dragStart.y;
@@ -993,7 +1975,7 @@ void FolderWidget::OnMouseMove(int x, int y) {
         // newX is the Window Top-Left. UpdatePosition expects Anchor position.
         int anchorX = newX;
         if (m_data.isExpanded && m_expandLeft) {
-            anchorX += (EXPANDED_WIDTH + 8);
+            anchorX += (GetExpandedPaneWidth() + PANE_GAP);
         }
         
         UpdatePosition(anchorX, newY);
@@ -1046,6 +2028,7 @@ void WidgetManager::Initialize(HINSTANCE hInstance) {
     // Initialize GDI+
     GdiplusStartupInput gdiplusStartupInput;
     GdiplusStartup(&g_gdiplusToken, &gdiplusStartupInput, nullptr);
+    EnsureUiAssets();
     
     // Ensure config directory exists
     EnsureConfigDirectory();
@@ -1061,11 +2044,20 @@ void WidgetManager::Shutdown() {
     SaveToConfig();
     RemoveSystemTray();
     m_folders.clear();
+    ReleaseUiAssets();
     GdiplusShutdown(g_gdiplusToken);
 }
 
 FolderWidget* WidgetManager::CreateFolder(const FolderData& data) {
-    auto widget = std::make_unique<FolderWidget>(data);
+    FolderData adjustedData = data;
+    adjustedData.iconSize = NormalizeFolderIconSize(adjustedData.iconSize);
+    adjustedData.paneWidth = (std::max)(MIN_PANE_WIDTH, adjustedData.paneWidth);
+    adjustedData.paneHeight = (std::max)(MIN_PANE_HEIGHT, adjustedData.paneHeight);
+    POINT resolved = ResolveFolderPosition(nullptr, adjustedData.posX, adjustedData.posY, adjustedData.iconSize);
+    adjustedData.posX = resolved.x;
+    adjustedData.posY = resolved.y;
+
+    auto widget = std::make_unique<FolderWidget>(adjustedData);
     if (widget->Create(m_hInstance)) {
         widget->Show();
         FolderWidget* ptr = widget.get();
@@ -1102,10 +2094,12 @@ Bitmap* FolderWidget::GetIconForFile(const std::wstring& path) {
     // Load icon
     SHFILEINFOW sfi = {0};
     if (SHGetFileInfoW(path.c_str(), 0, &sfi, sizeof(sfi), SHGFI_ICON | SHGFI_LARGEICON)) {
-        Bitmap* bmp = Bitmap::FromHICON(sfi.hIcon);
-        m_iconCache[path] = bmp;
+        Bitmap* bmp = CreateBitmapFromIcon(sfi.hIcon, 64);
         DestroyIcon(sfi.hIcon);
-        return bmp;
+        if (bmp) {
+            m_iconCache[path] = bmp;
+            return bmp;
+        }
     }
     
     return nullptr;
@@ -1123,6 +2117,9 @@ void WidgetManager::LoadFromConfig() {
         data.color = HexToColorRef(cfg.color);
         data.posX = cfg.posX;
         data.posY = cfg.posY;
+        data.iconSize = NormalizeFolderIconSize(cfg.iconSize);
+        data.paneWidth = (std::max)(MIN_PANE_WIDTH, cfg.paneWidth);
+        data.paneHeight = (std::max)(MIN_PANE_HEIGHT, cfg.paneHeight);
         data.isExpanded = false;
         
         for (const auto& item : cfg.items) {
@@ -1134,6 +2131,10 @@ void WidgetManager::LoadFromConfig() {
         }
         
         CreateFolder(data);
+    }
+
+    if (!configs.empty()) {
+        SaveToConfig();
     }
 }
 
@@ -1155,6 +2156,9 @@ void WidgetManager::SaveToConfig() {
         
         cfg.posX = data.posX;
         cfg.posY = data.posY;
+        cfg.iconSize = data.iconSize;
+        cfg.paneWidth = data.paneWidth;
+        cfg.paneHeight = data.paneHeight;
         
         for (const auto& item : data.items) {
             cfg.items.push_back({ item.name, item.path });
@@ -1169,36 +2173,33 @@ void WidgetManager::SaveToConfig() {
 // Tray window procedure
 LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
-        case WM_TRAYICON:
-            if (lParam == WM_RBUTTONUP || lParam == WM_LBUTTONUP) {
+        case WM_TRAYICON: {
+            const UINT notifyEvent = LOWORD(lParam);
+
+            if (notifyEvent == WM_CONTEXTMENU) {
+                POINT anchor = {
+                    static_cast<LONG>(static_cast<SHORT>(LOWORD(wParam))),
+                    static_cast<LONG>(static_cast<SHORT>(HIWORD(wParam)))
+                };
+                WidgetManager::Instance().ShowTrayMenu(anchor);
+            } else if (notifyEvent == WM_RBUTTONUP || notifyEvent == WM_LBUTTONUP ||
+                       notifyEvent == NIN_SELECT || notifyEvent == NIN_KEYSELECT) {
                 WidgetManager::Instance().ShowTrayMenu();
             }
             return 0;
-            
-        case WM_COMMAND:
-            switch (LOWORD(wParam)) {
-                case ID_TRAY_NEW_FOLDER: {
-                    FolderData data;
-                    data.id = L"folder-" + std::to_wstring(GetTickCount64());
-                    data.name = L"New Folder";
-                    data.color = RGB(59, 130, 246);
-                    data.posX = 150;
-                    data.posY = 150;
-                    data.isExpanded = false;
-                    WidgetManager::Instance().CreateFolder(data);
-                    WidgetManager::Instance().SaveToConfig();
-                    break;
-                }
-                case ID_TRAY_SHOW_ALL:
-                    for (auto& folder : WidgetManager::Instance().GetFolders()) {
-                        folder->Show();
-                    }
-                    break;
-                case ID_TRAY_EXIT:
-                    PostQuitMessage(0);
-                    break;
+        }
+
+        case WM_MEASUREITEM:
+            if (HandleStyledMenuMeasure(reinterpret_cast<MEASUREITEMSTRUCT*>(lParam))) {
+                return TRUE;
             }
-            return 0;
+            break;
+
+        case WM_DRAWITEM:
+            if (HandleStyledMenuDraw(reinterpret_cast<DRAWITEMSTRUCT*>(lParam))) {
+                return TRUE;
+            }
+            break;
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
@@ -1210,6 +2211,9 @@ void WidgetManager::CreateSystemTray() {
     wc.lpfnWndProc = TrayWndProc;
     wc.hInstance = m_hInstance;
     wc.lpszClassName = TRAY_CLASS;
+    wc.hIcon = GetAppIcon(false);
+    wc.hIconSm = GetAppIcon(true);
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     RegisterClassExW(&wc);
     
     m_trayHwnd = CreateWindowExW(0, TRAY_CLASS, L"TrayWindow", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, m_hInstance, nullptr);
@@ -1221,10 +2225,12 @@ void WidgetManager::CreateSystemTray() {
     m_trayIcon.uID = 1;
     m_trayIcon.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     m_trayIcon.uCallbackMessage = WM_TRAYICON;
-    m_trayIcon.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
-    wcscpy_s(m_trayIcon.szTip, L"Folder Widgets");
+    m_trayIcon.hIcon = GetAppIcon(true);
+    m_trayIcon.uVersion = NOTIFYICON_VERSION_4;
+    wcscpy_s(m_trayIcon.szTip, APP_TITLE);
     
     Shell_NotifyIconW(NIM_ADD, &m_trayIcon);
+    Shell_NotifyIconW(NIM_SETVERSION, &m_trayIcon);
 }
 
 void WidgetManager::RemoveSystemTray() {
@@ -1233,21 +2239,35 @@ void WidgetManager::RemoveSystemTray() {
 }
 
 void WidgetManager::ShowTrayMenu() {
-    HMENU hMenu = CreatePopupMenu();
-    
-    AppendMenuW(hMenu, MF_STRING, ID_TRAY_NEW_FOLDER, L"➕ New Folder");
-    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(hMenu, MF_STRING, ID_TRAY_SHOW_ALL, L"📁 Show All Folders");
-    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"❌ Exit");
-    
     POINT pt;
     GetCursorPos(&pt);
-    
+    ShowTrayMenu(pt);
+}
+
+void WidgetManager::ShowTrayMenu(POINT anchor) {
+    HMENU hMenu = CreateStyledPopupMenu();
+
+    AppendStyledMenuItem(hMenu, ID_TRAY_NEW_FOLDER);
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+    AppendStyledMenuItem(hMenu, ID_TRAY_EXIT);
+
     SetForegroundWindow(m_trayHwnd);
-    TrackPopupMenu(hMenu, TPM_BOTTOMALIGN | TPM_LEFTALIGN, pt.x, pt.y, 0, m_trayHwnd, nullptr);
-    
+    UINT command = TrackPopupMenu(
+        hMenu,
+        TPM_RETURNCMD | TPM_BOTTOMALIGN | TPM_LEFTALIGN | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+        anchor.x,
+        anchor.y,
+        0,
+        m_trayHwnd,
+        nullptr
+    );
+
     DestroyMenu(hMenu);
+    PostMessageW(m_trayHwnd, WM_NULL, 0, 0);
+
+    if (command != 0) {
+        ExecuteTrayCommand(command);
+    }
 }
 
 // ============================================

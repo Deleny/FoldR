@@ -13,6 +13,9 @@ struct ConfigFolder {
     std::string color;
     int posX;
     int posY;
+    int iconSize = 64;
+    int paneWidth = 360;
+    int paneHeight = 280;
     std::vector<std::pair<std::wstring, std::wstring>> items; // name, path pairs
 };
 
@@ -110,6 +113,9 @@ inline std::vector<ConfigFolder> Config::LoadFolders(const std::wstring& path) {
         def.color = "#3B82F6";
         def.posX = 100;
         def.posY = 100;
+        def.iconSize = 64;
+        def.paneWidth = 360;
+        def.paneHeight = 280;
         folders.push_back(def);
         return folders;
     }
@@ -263,6 +269,11 @@ inline std::vector<ConfigFolder> Config::LoadFolders(const std::wstring& path) {
         else if (key == "color") current.color = value;
         else if (key == "posX") current.posX = std::stoi(value);
         else if (key == "posY") current.posY = std::stoi(value);
+        else if (key == "iconSize") current.iconSize = std::stoi(value);
+        else if (key == "paneWidth") current.paneWidth = std::stoi(value);
+        else if (key == "paneHeight") current.paneHeight = std::stoi(value);
+        else if (key == "gridColumns") current.paneWidth = 24 + 84 * (std::stoi(value) <= 3 ? 3 : 4);
+        else if (key == "visibleRows") current.paneHeight = 24 + 80 * (std::stoi(value) <= 3 ? 3 : (std::stoi(value) >= 5 ? 5 : 4));
     }
     
     if (folders.empty()) {
@@ -272,6 +283,9 @@ inline std::vector<ConfigFolder> Config::LoadFolders(const std::wstring& path) {
         def.color = "#3B82F6";
         def.posX = 100;
         def.posY = 100;
+        def.iconSize = 64;
+        def.paneWidth = 360;
+        def.paneHeight = 280;
         folders.push_back(def);
     }
     
@@ -291,6 +305,9 @@ inline bool Config::SaveFolders(const std::wstring& path, const std::vector<Conf
         file << "        \"color\": \"" << f.color << "\",\n";
         file << "        \"posX\": " << f.posX << ",\n";
         file << "        \"posY\": " << f.posY << ",\n";
+        file << "        \"iconSize\": " << f.iconSize << ",\n";
+        file << "        \"paneWidth\": " << f.paneWidth << ",\n";
+        file << "        \"paneHeight\": " << f.paneHeight << ",\n";
         file << "        \"items\": [\n";
         for (size_t j = 0; j < f.items.size(); j++) {
             std::string escapedName = EscapeJsonString(WStringToString(f.items[j].first));
