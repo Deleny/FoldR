@@ -20,6 +20,8 @@
 -  **System tray** - Arka planda çalışır
 -  **Sağ tık menüsü** - Kolay ayarlar
 
+<p align="center">
+
 ##  Gereksinimler
 
 | Gereksinim | Versiyon |
@@ -27,6 +29,7 @@
 | İşletim Sistemi | Windows 10/11 |
 | Derleyici | Visual Studio 2019/2022 veya MinGW |
 | CMake | 3.20+ |
+</p>
 
 ##  Kurulum
 
