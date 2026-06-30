@@ -1,4 +1,4 @@
-# 📁 Folder Widget
+#  Folder Widget
 
 **Windows masaüstü için özelleştirilebilir klasör widget'ları - C++ Win32 API**
 
@@ -10,17 +10,17 @@
   <img src="screenshots/preview.png" alt="Folder Widget Preview" width="500">
 </p>
 
-## ✨ Özellikler
+##  Özellikler
 
-- 📁 **Birden fazla klasör** - İstediğiniz kadar widget oluşturun
-- 🎨 **Renk özelleştirmesi** - Her klasör için farklı renk seçin
-- 🖱️ **Sürükle-bırak** - Dosyaları kolayca ekleyin
-- 💾 **Otomatik kaydetme** - Pozisyon ve içerik otomatik saklanır
-- 🔄 **Animasyonlu açılma** - Tıklayınca sağa doğru genişler
-- 🖥️ **System tray** - Arka planda çalışır
-- ⚙️ **Sağ tık menüsü** - Kolay ayarlar
+-  **Birden fazla klasör** - İstediğiniz kadar widget oluşturun
+-  **Renk özelleştirmesi** - Her klasör için farklı renk seçin
+-  **Sürükle-bırak** - Dosyaları kolayca ekleyin
+-  **Otomatik kaydetme** - Pozisyon ve içerik otomatik saklanır
+-  **Animasyonlu açılma** - Tıklayınca sağa doğru genişler
+-  **System tray** - Arka planda çalışır
+-  **Sağ tık menüsü** - Kolay ayarlar
 
-## 🛠️ Gereksinimler
+##  Gereksinimler
 
 | Gereksinim | Versiyon |
 |------------|----------|
@@ -28,7 +28,7 @@
 | Derleyici | Visual Studio 2019/2022 veya MinGW |
 | CMake | 3.20+ |
 
-## 🚀 Kurulum
+##  Kurulum
 
 ### Otomatik Derleme
 ```batch
@@ -48,7 +48,7 @@ cmake .. -G "Visual Studio 17 2022" -A x64
 cmake --build . --config Release
 ```
 
-## 📖 Kullanım
+##  Kullanım
 
 1. `build\Release\FolderWidget.exe` dosyasını çalıştırın
 2. Masaüstünüzde bir klasör ikonu görünecek
@@ -60,7 +60,7 @@ cmake --build . --config Release
 | **Dosya sürükle** | Klasöre ekle |
 | **System tray** | Yeni klasör oluştur |
 
-## 📂 Proje Yapısı
+##  Proje Yapısı
 
 ```
 folder-widget/
@@ -76,19 +76,19 @@ folder-widget/
 └── README.md
 ```
 
-## 🔧 Teknik Detaylar
+##  Teknik Detaylar
 
 - **Pure Win32 API** - Harici framework bağımlılığı yok
 - **GDI+** - Grafik renderlemesi
 - **JSON** - Konfigürasyon dosya formatı
 - **Modern C++17** - Standart
 
-## 📝 Lisans
+##  Lisans
 
 Bu proje [MIT Lisansı](LICENSE) altında lisanslanmıştır.
 
 ---
 
 <p align="center">
-  Made with ❤️ using C++ and Win32 API
+  Made with ♥ using C++ and Win32 API
 </p>
